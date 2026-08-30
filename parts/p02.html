@@ -73,6 +73,8 @@
   border:1px solid rgba(223,243,236,.35);padding:12px 0;text-align:center;pointer-events:auto;
   transition:background .2s,box-shadow .2s}
 .cta:hover{background:rgba(223,243,236,.1);box-shadow:0 0 26px rgba(143,212,255,.18)}
+.github-cta{display:block;text-decoration:none;margin-top:10px;font-size:11px;letter-spacing:.22em;color:var(--ice);border:1px solid rgba(143,212,255,.32);background:rgba(143,212,255,.05);padding:11px 0;text-align:center;pointer-events:auto;transition:background .2s,box-shadow .2s,border-color .2s}
+.github-cta:hover{background:rgba(143,212,255,.14);box-shadow:0 0 22px rgba(143,212,255,.28);color:#fff;border-color:rgba(143,212,255,.6)}
 .small{font-size:11px;color:var(--faint);letter-spacing:.12em;margin-top:14px;line-height:1.7}
 #screen-load .bar{height:2px;background:rgba(255,255,255,.14);margin-top:20px}
 #screen-load .bar u{display:block;height:100%;width:0;background:var(--hud);transition:width .2s}
@@ -168,6 +170,7 @@
       <span><b>SPACE</b>Handbrake / drift</span><span><b>ESC</b>Pause</span>
     </div>
     <div class="cta" id="btn-deploy">CLICK TO DEPLOY</div>
+    <a class="github-cta" href="https://github.com/Royverse/cold-wake" target="_blank" rel="noopener noreferrer">OPEN SOURCE ON GITHUB &middot; ROYVERSE/COLD-WAKE</a>
     <div class="small">Mouse is captured on deploy &middot; ESC releases it.<br/>
       Estimated run time 8&ndash;12 minutes &middot; checkpoints are automatic.</div>
   </div>
@@ -183,6 +186,7 @@
       <div class="cta" id="btn-resume">RESUME</div>
       <div class="cta" id="btn-check">RESTART CHECKPOINT</div>
       <div class="cta" id="btn-restart">RESTART MISSION</div>
+      <a class="github-cta" href="https://github.com/Royverse/cold-wake" target="_blank" rel="noopener noreferrer">SOURCE CODE ON GITHUB</a>
     </div>
     <div class="small">Quality: <span id="qtag">AUTO</span> &middot; press Q to cycle &middot; press P for perf overlay</div>
   </div>
@@ -195,7 +199,10 @@
     <div class="h2" id="endsub">SPARROW 2-1 IS OFF THE X</div>
     <div class="rule"></div>
     <div class="stats" id="endstats"></div>
-    <div class="btnrow"><div class="cta" id="btn-again">RUN IT AGAIN</div></div>
+    <div class="btnrow">
+      <div class="cta" id="btn-again">RUN IT AGAIN</div>
+      <a class="github-cta" href="https://github.com/Royverse/cold-wake" target="_blank" rel="noopener noreferrer">VIEW SOURCE ON GITHUB</a>
+    </div>
   </div>
 </div>
 
