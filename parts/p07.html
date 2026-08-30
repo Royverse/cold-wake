@@ -1,0 +1,293 @@
+
+/* ============================ 06 water ============================= */
+/* Four Gerstner waves shared by GPU + CPU, drawn through a 5 level
+   clipmap centred on the camera. A world space R8 target accumulates
+   wake foam splatted from every craft trail each frame.                */
+
+const WAVE = [
+  // dirX, dirZ, amplitude, wavelength, speed, steepness
+  [1.00, 0.16, 0.62, 47, 5.4, 0.85],
+  [0.62, -0.78, 0.34, 26, 4.1, 0.75],
+  [-0.35, 0.94, 0.17, 13.5, 3.2, 0.60],
+  [0.88, 0.47, 0.085, 7.2, 2.4, 0.45],
+];
+const waveA = new Float32Array(16), waveB = new Float32Array(16);
+for (let i = 0; i < 4; i++) {
+  const w = WAVE[i], l = Math.hypot(w[0], w[1]);
+  waveA[i * 4] = w[0] / l; waveA[i * 4 + 1] = w[1] / l; waveA[i * 4 + 2] = w[2]; waveA[i * 4 + 3] = w[3];
+  waveB[i * 4] = w[4]; waveB[i * 4 + 1] = w[5];
+}
+/** CPU mirror of the vertex shader wave sum (vertical component only) */
+function waterY(x, z, t) {
+  let y = 0;
+  for (let i = 0; i < 4; i++) {
+    const k = TAU / waveA[i * 4 + 3];
+    const f = k * (waveA[i * 4] * x + waveA[i * 4 + 1] * z) - waveB[i * 4] * k * t;
+    y += waveA[i * 4 + 2] * sin(f);
+  }
+  return y;
+}
+function waterNormal(x, z, t, o) {
+  const e = 1.2;
+  const hL = waterY(x - e, z, t), hR = waterY(x + e, z, t);
+  const hD = waterY(x, z - e, t), hU = waterY(x, z + e, t);
+  o = o || [0, 1, 0];
+  const nx = (hL - hR) / (2 * e), nz = (hD - hU) / (2 * e);
+  const il = 1 / Math.hypot(nx, 1, nz);
+  o[0] = nx * il; o[1] = il; o[2] = nz * il;
+  return o;
+}
+
+const Water = {
+  tiles: [],
+  build() {
+    const N = 48;
+    // centre tile
+    this.tiles.push({ mesh: this._grid(N, 0), half: 60 });
+    let half = 60;
+    for (let r = 0; r < 4; r++) {
+      half *= 3;
+      this.tiles.push({ mesh: this._grid(N, 7), half });
+    }
+  },
+  /** unit grid over [-1,1]; `hole` = cells removed from the centre */
+  _grid(N, hole) {
+    const verts = new Float32Array((N + 1) * (N + 1) * 2);
+    let o = 0;
+    for (let y = 0; y <= N; y++) for (let x = 0; x <= N; x++) {
+      verts[o++] = x / N * 2 - 1; verts[o++] = y / N * 2 - 1;
+    }
+    const idx = [];
+    const h0 = N / 2 - hole, h1 = N / 2 + hole;
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+      if (hole > 0 && x >= h0 && x < h1 && y >= h0 && y < h1) continue;
+      const v0 = y * (N + 1) + x, v1 = v0 + 1, v2 = v0 + N + 1, v3 = v2 + 1;
+      idx.push(v0, v2, v1, v1, v2, v3);
+    }
+    return mkMeshGL(verts, new Uint32Array(idx), [{ n: 2 }]);
+  },
+  draw(sh, camX, camZ) {
+    for (let i = 0; i < this.tiles.length; i++) {
+      const t = this.tiles[i];
+      const cell = t.half * 2 / 48;
+      const ox = Math.round(camX / cell) * cell, oz = Math.round(camZ / cell) * cell;
+      sh.v2('uTileOfs', ox, oz).f('uTileScale', t.half).f('uTileBias', i * 0.035);
+      gl.bindVertexArray(t.mesh.vao);
+      gl.drawElements(gl.TRIANGLES, t.mesh.count, gl.UNSIGNED_INT, 0);
+    }
+  },
+};
+
+/* ---- wake foam accumulation target ---- */
+const Foam = {
+  SIZE: 460,               // world metres covered
+  RES: 1024,
+  fbo: null, ctr: [0, 0],
+  cap: 1400, n: 0, data: null, vao: null, ibuf: null, quad: null,
+  init() {
+    this.fbo = mkFbo(this.RES, this.RES, { i: gl.R8, f: gl.RED, t: gl.UNSIGNED_BYTE });
+    this.data = new Float32Array(this.cap * 8);
+    // static quad + per-splat instance stream
+    this.vao = gl.createVertexArray();
+    gl.bindVertexArray(this.vao);
+    this.quad = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quad);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    this.ibuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.ibuf);
+    gl.bufferData(gl.ARRAY_BUFFER, this.data.byteLength, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 32, 0); gl.vertexAttribDivisor(1, 1);
+    gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 32, 16); gl.vertexAttribDivisor(2, 1);
+    gl.bindVertexArray(null);
+  },
+  begin(cx, cz) { this.n = 0; this.ctr[0] = cx; this.ctr[1] = cz; },
+  add(x, z, r, str, dx, dz, elong, hard) {
+    if (this.n >= this.cap) return;
+    const o = this.n * 8;
+    const d = this.data;
+    d[o] = x; d[o + 1] = z; d[o + 2] = r; d[o + 3] = str;
+    d[o + 4] = dx; d[o + 5] = dz; d[o + 6] = elong; d[o + 7] = hard;
+    this.n++;
+  },
+  render(sh) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo.fb);
+    gl.viewport(0, 0, this.RES, this.RES);
+    gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    if (!this.n) return;
+    gl.disable(gl.DEPTH_TEST); gl.depthMask(false);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+    sh.use().v2('uFoamCtr', this.ctr[0], this.ctr[1]).f('uFoamSize', this.SIZE);
+    gl.bindVertexArray(this.vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.ibuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.data, 0, this.n * 8);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.n);
+    gl.disable(gl.BLEND);
+    gl.bindVertexArray(null);
+  },
+};
+
+/* ============================ 07 meshes ============================ */
+/* Small immediate-mode builder: everything in the world is assembled
+   from boxes, cylinders, spheres and lofted hull sections.             */
+
+class Builder {
+  constructor() { this.v = []; this.i = []; this.m = M4.create(); this.st = []; }
+  save() { this.st.push(new Float32Array(this.m)); return this; }
+  restore() { this.m = this.st.pop(); return this; }
+  /** local transform (applied before existing) */
+  tf(p, yaw, pitch, roll, sx, sy, sz) {
+    const t = M4.create();
+    M4.compose(t, p || [0, 0, 0], yaw || 0, pitch || 0, roll || 0,
+      sx === undefined ? 1 : sx, sy === undefined ? (sx === undefined ? 1 : sx) : sy,
+      sz === undefined ? (sx === undefined ? 1 : sx) : sz);
+    M4.mul(this.m, this.m, t); return this;
+  }
+  vert(p, n, c, r) {
+    const wp = M4.xformPoint(this.m, p), wn = V3.norm(M4.xformDir(this.m, n));
+    this.v.push(wp[0], wp[1], wp[2], wn[0], wn[1], wn[2], c[0], c[1], c[2], r);
+    return this.v.length / 10 - 1;
+  }
+  tri(a, b, c) { this.i.push(a, b, c); }
+  quad(a, b, c, d) { this.i.push(a, b, c, a, c, d); }
+  /** axis aligned box centred at `o` */
+  box(o, sx, sy, sz, c, r) {
+    const hx = sx * .5, hy = sy * .5, hz = sz * .5;
+    const F = [
+      [[0, 0, 1], [[-hx, -hy, hz], [hx, -hy, hz], [hx, hy, hz], [-hx, hy, hz]]],
+      [[0, 0, -1], [[hx, -hy, -hz], [-hx, -hy, -hz], [-hx, hy, -hz], [hx, hy, -hz]]],
+      [[1, 0, 0], [[hx, -hy, hz], [hx, -hy, -hz], [hx, hy, -hz], [hx, hy, hz]]],
+      [[-1, 0, 0], [[-hx, -hy, -hz], [-hx, -hy, hz], [-hx, hy, hz], [-hx, hy, -hz]]],
+      [[0, 1, 0], [[-hx, hy, hz], [hx, hy, hz], [hx, hy, -hz], [-hx, hy, -hz]]],
+      [[0, -1, 0], [[-hx, -hy, -hz], [hx, -hy, -hz], [hx, -hy, hz], [-hx, -hy, hz]]],
+    ];
+    for (const f of F) {
+      const idx = f[1].map(p => this.vert([p[0] + o[0], p[1] + o[1], p[2] + o[2]], f[0], c, r));
+      this.quad(idx[0], idx[1], idx[2], idx[3]);
+    }
+    return this;
+  }
+  /** cylinder along +Y, base at o */
+  cyl(o, r0, r1, h, seg, c, rough, caps) {
+    const ring0 = [], ring1 = [];
+    for (let i = 0; i <= seg; i++) {
+      const a = i / seg * TAU, ca = cos(a), sa = sin(a);
+      const nrm = V3.norm([ca * h, (r0 - r1), sa * h]);
+      ring0.push(this.vert([o[0] + ca * r0, o[1], o[2] + sa * r0], nrm, c, rough));
+      ring1.push(this.vert([o[0] + ca * r1, o[1] + h, o[2] + sa * r1], nrm, c, rough));
+    }
+    for (let i = 0; i < seg; i++) this.quad(ring0[i], ring0[i + 1], ring1[i + 1], ring1[i]);
+    if (caps !== false) {
+      const cA = this.vert([o[0], o[1], o[2]], [0, -1, 0], c, rough);
+      const cB = this.vert([o[0], o[1] + h, o[2]], [0, 1, 0], c, rough);
+      for (let i = 0; i < seg; i++) {
+        const a0 = i / seg * TAU, a1 = (i + 1) / seg * TAU;
+        const p0 = this.vert([o[0] + cos(a0) * r0, o[1], o[2] + sin(a0) * r0], [0, -1, 0], c, rough);
+        const p1 = this.vert([o[0] + cos(a1) * r0, o[1], o[2] + sin(a1) * r0], [0, -1, 0], c, rough);
+        this.tri(cA, p1, p0);
+        const q0 = this.vert([o[0] + cos(a0) * r1, o[1] + h, o[2] + sin(a0) * r1], [0, 1, 0], c, rough);
+        const q1 = this.vert([o[0] + cos(a1) * r1, o[1] + h, o[2] + sin(a1) * r1], [0, 1, 0], c, rough);
+        this.tri(cB, q0, q1);
+      }
+    }
+    return this;
+  }
+  sphere(o, r, seg, c, rough, squashY) {
+    const sy = squashY === undefined ? 1 : squashY;
+    const rows = max(3, seg >> 1);
+    const grid = [];
+    for (let y = 0; y <= rows; y++) {
+      const v = y / rows * PI, sv = sin(v), cv = cos(v), row = [];
+      for (let x = 0; x <= seg; x++) {
+        const u = x / seg * TAU;
+        const n = [sv * cos(u), cv, sv * sin(u)];
+        row.push(this.vert([o[0] + n[0] * r, o[1] + n[1] * r * sy, o[2] + n[2] * r], [n[0], n[1] / sy, n[2]], c, rough));
+      }
+      grid.push(row);
+    }
+    for (let y = 0; y < rows; y++) for (let x = 0; x < seg; x++)
+      this.quad(grid[y][x], grid[y][x + 1], grid[y + 1][x + 1], grid[y + 1][x]);
+    return this;
+  }
+  /** loft a rounded-V hull section along -Z..+Z */
+  hull(len, wid, hgt, secs, c, rough, deckDrop) {
+    const rings = [];
+    const P = 9;
+    for (let s = 0; s <= secs; s++) {
+      const t = s / secs;                        // 0 stern -> 1 bow
+      const z = (t - .5) * len;
+      const taper = Math.pow(sin(clamp(t * 1.02, 0, 1) * PI * .5 + .12), .6);
+      const bow = smoothstep(.62, 1, t);
+      const w = wid * .5 * lerp(1, .34, bow * bow) * taper;
+      const hh = hgt * lerp(1, .82, bow);
+      const yTop = hgt * .5 - (deckDrop || 0) * smoothstep(.15, .75, t) + bow * hgt * .28;
+      const ring = [];
+      for (let p = 0; p <= P; p++) {
+        const a = p / P * PI;                    // 0..PI around the section
+        const ca = cos(a), sa = sin(a);
+        const x = -ca * w;
+        const y = yTop - (1 - sa * .35 - abs(ca) * .0) * hh * (1 - abs(ca) * .35);
+        ring.push([x, y, z]);
+      }
+      rings.push(ring);
+    }
+    const idx = [];
+    for (let s = 0; s <= secs; s++) {
+      const row = [];
+      for (let p = 0; p <= P; p++) {
+        const cur = rings[s][p];
+        const nb = rings[s][min(p + 1, P)], pv = rings[s][max(p - 1, 0)];
+        const fw = rings[min(s + 1, secs)][p], bk = rings[max(s - 1, 0)][p];
+        const u = V3.sub(nb, pv), v = V3.sub(fw, bk);
+        let n = V3.cross(u, v);
+        if (V3.len(n) < 1e-6) n = [0, 1, 0];
+        n = V3.norm(n);
+        if (n[1] < -0.2 && cur[1] > 0) n = V3.scale(n, -1);
+        row.push(this.vert(cur, n, c, rough));
+      }
+      idx.push(row);
+    }
+    for (let s = 0; s < secs; s++) for (let p = 0; p < P; p++)
+      this.quad(idx[s][p], idx[s][p + 1], idx[s + 1][p + 1], idx[s + 1][p]);
+    // deck cap
+    for (let s = 0; s < secs; s++) this.quad(idx[s][0], idx[s + 1][0], idx[s + 1][P], idx[s][P]);
+    return this;
+  }
+  /** irregular convex-ish rock / ice chunk */
+  chunk(o, r, seg, c, rough, seed) {
+    const rr2 = mulberry32(seed | 0);
+    const rows = max(3, seg >> 1), grid = [];
+    const amp = [];
+    for (let i = 0; i < 40; i++) amp.push(rr2());
+    for (let y = 0; y <= rows; y++) {
+      const v = y / rows * PI, sv = sin(v), cv = cos(v), row = [];
+      for (let x = 0; x <= seg; x++) {
+        const u = x / seg * TAU;
+        const n = [sv * cos(u), cv, sv * sin(u)];
+        const k = 1 + (vnoise(n[0] * 2.5 + amp[3] * 9, n[2] * 2.5 + n[1] * 2 + amp[7] * 9) - .5) * .85;
+        row.push({ p: [o[0] + n[0] * r * k, o[1] + n[1] * r * k * .85, o[2] + n[2] * r * k], n });
+      }
+      grid.push(row);
+    }
+    const idx = [];
+    for (let y = 0; y <= rows; y++) {
+      const row = [];
+      for (let x = 0; x <= seg; x++) {
+        const a = grid[y][min(x + 1, seg)].p, b = grid[y][max(x - 1, 0)].p;
+        const cc = grid[min(y + 1, rows)][x].p, d = grid[max(y - 1, 0)][x].p;
+        let n = V3.cross(V3.sub(a, b), V3.sub(cc, d));
+        if (V3.len(n) < 1e-5) n = grid[y][x].n;
+        n = V3.norm(n);
+        if (V3.dot(n, grid[y][x].n) < 0) n = V3.scale(n, -1);
+        row.push(this.vert(grid[y][x].p, n, c, rough));
+      }
+      idx.push(row);
+    }
+    for (let y = 0; y < rows; y++) for (let x = 0; x < seg; x++)
+      this.quad(idx[y][x], idx[y][x + 1], idx[y + 1][x + 1], idx[y + 1][x]);
+    return this;
+  }
+  gl() {
+    return mkMeshGL(new Float32Array(this.v), new Uint32Array(this.i), [{ n: 3 }, { n: 3 }, { n: 3 }, { n: 1 }]);
+  }
+}

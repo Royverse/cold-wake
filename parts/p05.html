@@ -1,0 +1,369 @@
+
+/* ----------------------------- water -------------------------------- */
+/* Clipmap tiles + 4 Gerstner waves (mirrored on the CPU for buoyancy),
+   planar reflection, depth based absorption, wake foam buffer.          */
+const VS_WATER = G_HEAD + `
+layout(location=0) in vec2 aXZ;
+uniform mat4 uVP;
+uniform vec2 uTileOfs;
+uniform float uTileScale;
+uniform float uTileBias;
+uniform vec4 uWaveA[4];   // dir.xy, amplitude, wavelength
+uniform vec4 uWaveB[4];   // speed, steepness
+uniform vec3 uCam;
+uniform float uTime;
+out vec3 vW; out vec3 vN; out float vCrest; out float vDist;
+
+vec3 gerst(vec2 p, float att, out vec3 nrm, out float crest){
+  vec3 disp = vec3(0.0);
+  vec3 tang = vec3(1.0,0.0,0.0), bit = vec3(0.0,0.0,1.0);
+  crest = 0.0;
+  for(int i=0;i<4;i++){
+    vec2 d = normalize(uWaveA[i].xy);
+    float a = uWaveA[i].z*att;
+    float k = 6.2831853/uWaveA[i].w;
+    float f = k*dot(d,p) - uWaveB[i].x*k*uTime;
+    float q = min(uWaveB[i].y/(k*a*4.0+1e-4), 1.0);
+    float s = sin(f), c = cos(f);
+    disp.x += q*a*d.x*c; disp.z += q*a*d.y*c; disp.y += a*s;
+    tang.x += -q*a*k*d.x*d.x*s; tang.y += a*k*d.x*c; tang.z += -q*a*k*d.x*d.y*s;
+    bit.x  += -q*a*k*d.x*d.y*s; bit.y += a*k*d.y*c;  bit.z += -q*a*k*d.y*d.y*s;
+    crest += s*a;
+  }
+  nrm = normalize(cross(bit, tang));
+  return disp;
+}
+void main(){
+  vec2 p = aXZ*uTileScale + uTileOfs;
+  float d = length(p - uCam.xz);
+  vDist = d;
+  float att = 1.0 - smoothstep(220.0, 1400.0, d);   // flatten far water (anti-alias)
+  vec3 n; float cr;
+  vec3 disp = gerst(p, att, n, cr);
+  vec3 w = vec3(p.x + disp.x, disp.y - uTileBias, p.y + disp.z);
+  vW = w; vN = n; vCrest = cr;
+  gl_Position = uVP*vec4(w,1.0);
+}`;
+
+const FS_WATER = G_HEAD + G_ENV + G_PBR + G_SHADOW + `
+in vec3 vW; in vec3 vN; in float vCrest; in float vDist;
+layout(location=0) out vec4 oCol;
+uniform sampler2D uRefl;
+uniform sampler2D uRefr;
+uniform sampler2D uSceneD;
+uniform sampler2D uFoamTex;
+uniform sampler2D uWaterN;
+uniform vec2  uInvRes;
+uniform vec2  uFoamCtr;
+uniform float uFoamSize;
+uniform float uNear;
+uniform float uFar;
+uniform float uReflOn;
+
+float linZ(float d){ float z = d*2.0-1.0; return (2.0*uNear*uFar)/(uFar+uNear - z*(uFar-uNear)); }
+
+void main(){
+  vec2 suv = gl_FragCoord.xy*uInvRes;
+  vec3 dv = uCam - vW; float dist = length(dv); vec3 V = dv/max(dist,1e-4);
+
+  /* ---- detail normals: two scrolling octaves, faded by distance ---- */
+  float df = 1.0 - smoothstep(60.0, 700.0, dist);
+  vec2 t1 = vW.xz*0.055 + vec2(uTime*0.021, uTime*0.013);
+  vec2 t2 = vW.xz*0.145 - vec2(uTime*0.037, uTime*0.019);
+  vec2 t3 = vW.xz*0.42  + vec2(uTime*0.09, -uTime*0.05);
+  vec3 d1 = texture(uWaterN, t1).xyz*2.0-1.0;
+  vec3 d2 = texture(uWaterN, t2).xyz*2.0-1.0;
+  vec3 d3 = texture(uWaterN, t3).xyz*2.0-1.0;
+  vec3 dn = d1*0.55 + d2*0.34 + d3*0.22*df;
+  vec3 N = normalize(vec3(vN.x + dn.x*1.15*df, vN.y, vN.z + dn.z*1.15*df));
+
+  /* ---- wake / foam buffer (world space splat target) ---- */
+  vec2 fuv = (vW.xz - uFoamCtr)/uFoamSize + 0.5;
+  float wake = 0.0;
+  if(fuv.x>0.0 && fuv.x<1.0 && fuv.y>0.0 && fuv.y<1.0){
+    wake = texture(uFoamTex, fuv).r;
+    wake *= smoothstep(0.0,0.06,fuv.x)*smoothstep(1.0,0.94,fuv.x)
+          * smoothstep(0.0,0.06,fuv.y)*smoothstep(1.0,0.94,fuv.y);
+  }
+  wake = clamp(wake, 0.0, 1.6);
+
+  /* ---- water depth from the opaque pass ---- */
+  float sceneD = texture(uSceneD, suv).r;
+  float zScene = linZ(sceneD), zWater = linZ(gl_FragCoord.z);
+  float thick = max(zScene - zWater, 0.0);
+
+  /* ---- refraction (offset sample, rejected when it grabs foreground) ---- */
+  vec2 rOff = N.xz*clamp(thick*0.35, 0.0, 1.0)*0.035*(1.0 - smoothstep(30.0,220.0,dist));
+  vec2 ruv = clamp(suv + rOff, vec2(0.001), vec2(0.999));
+  float sceneD2 = texture(uSceneD, ruv).r;
+  if(linZ(sceneD2) < zWater){ ruv = suv; sceneD2 = sceneD; }
+  float thick2 = max(linZ(sceneD2) - zWater, 0.0);
+  vec3 below = texture(uRefr, ruv).rgb;
+
+  /* ---- absorption / scattering ---- */
+  vec3 absorb = vec3(0.26, 0.085, 0.055);
+  vec3 trans = exp(-absorb*min(thick2, 60.0));
+  vec3 deepCol = vec3(0.014, 0.052, 0.070);
+  vec3 shallow = mix(deepCol, vec3(0.055,0.135,0.150), exp(-thick2*0.10));
+  vec3 refr = mix(deepCol, below*trans, clamp(trans.g*1.15, 0.0, 1.0));
+  refr = mix(refr, shallow, 0.35);
+  // sun scattering through the wave body
+  float back = pow(max(dot(V, -normalize(uSun - N*0.6)), 0.0), 3.0);
+  refr += vec3(0.06,0.17,0.16)*back*smoothstep(0.0,1.2,vCrest)*1.4;
+
+  /* ---- reflection ---- */
+  vec2 roff = N.xz*(0.05/(1.0 + dist*0.02));
+  vec2 reuv = clamp(suv + roff, vec2(0.002), vec2(0.998));
+  vec3 reflC = uReflOn>0.5 ? texture(uRefl, reuv).rgb : skyColor(reflect(-V,N));
+  reflC = mix(skyColor(reflect(-V,N)), reflC, uReflOn*smoothstep(0.0,0.06,reuv.y));
+
+  float NoV = max(dot(N,V), 0.0);
+  float F = 0.02 + 0.98*pow(1.0-NoV, 5.0);
+
+  vec3 col = mix(refr, reflC, F);
+
+  /* ---- sun specular ---- */
+  float NoL = max(dot(N,uSun),0.0);
+  float sh = shadowAt(vW, NoL);
+  vec3 H = normalize(uSun+V);
+  float NoH = max(dot(N,H),0.0);
+  float a = 0.055;
+  col += uSunCol*D_GGX(NoH, a*a)*V_Smith(max(NoV,1e-4), max(NoL,1e-4), a*a)*F*sh*3.2;
+  // high frequency glitter
+  float glit = pow(max(dot(normalize(N + d3*0.55), H), 0.0), 220.0);
+  col += uSunCol*glit*sh*0.9*df;
+
+  /* ---- foam: wake + crests + shoreline ---- */
+  float crestF = smoothstep(0.42, 0.95, vCrest*0.7 + dn.y*0.15);
+  float shoreF = smoothstep(1.35, 0.05, thick)*0.9;
+  float fn = texture(uNoise, vW.xz*0.09 + vec2(uTime*0.02, -uTime*0.014)).b;
+  float fn2 = texture(uNoise, vW.xz*0.33 - vec2(uTime*0.05, uTime*0.03)).r;
+  float foam = clamp(wake*1.15 + crestF*0.55 + shoreF, 0.0, 1.0);
+  foam *= smoothstep(0.16, 0.72, fn*0.55 + fn2*0.55);
+  foam = clamp(foam*1.25, 0.0, 1.0);
+  vec3 foamCol = mix(vec3(0.62,0.70,0.76), vec3(0.98,1.0,1.0), fn2);
+  foamCol *= (uSkyUp*0.55 + uSunCol*NoL*sh*0.55 + 0.22);
+  col = mix(col, foamCol, foam*0.92);
+
+  col = applyFog(col, -V, dist);
+  oCol = vec4(col, 1.0);
+}`;
+
+/* --------------------------- wake splats ---------------------------- */
+/* Every craft leaves ring-buffered trail points; they are re-splatted
+   into a world-space R8 target each frame so it can recentre freely.    */
+const VS_FOAM = G_HEAD + `
+layout(location=0) in vec2 aCorner;
+layout(location=1) in vec4 iXZRS;   // x, z, radius, strength
+layout(location=2) in vec4 iDir;    // dirx, dirz, elongation, hardness
+uniform vec2 uFoamCtr; uniform float uFoamSize;
+out vec2 vLocal; out float vStr; out float vHard;
+void main(){
+  vec2 d = normalize(iDir.xy + vec2(1e-5));
+  vec2 side = vec2(-d.y, d.x);
+  vec2 off = (d*aCorner.y*iDir.z + side*aCorner.x)*iXZRS.z;
+  vec2 wp = iXZRS.xy + off;
+  vLocal = aCorner; vStr = iXZRS.w; vHard = iDir.w;
+  vec2 ndc = (wp - uFoamCtr)/uFoamSize*2.0;
+  gl_Position = vec4(ndc, 0.0, 1.0);
+}`;
+const FS_FOAM = G_HEAD + `
+in vec2 vLocal; in float vStr; in float vHard;
+layout(location=0) out vec4 oCol;
+void main(){
+  float r = length(vLocal);
+  float a = pow(max(1.0 - r, 0.0), mix(2.4, 0.7, vHard));
+  oCol = vec4(a*vStr, 0.0, 0.0, 1.0);
+}`;
+
+/* --------------------------- particles ------------------------------ */
+const VS_PART = G_HEAD + `
+layout(location=0) in vec2 aCorner;
+layout(location=1) in vec4 iPosSize;
+layout(location=2) in vec4 iVelStr;
+layout(location=3) in vec4 iCol;
+layout(location=4) in vec4 iMisc;    // rot, tile, soft, emissive
+uniform mat4 uVP; uniform vec3 uCamR; uniform vec3 uCamU; uniform vec3 uCam;
+out vec2 vUv; out vec4 vCol; out float vSoft; out float vEmis; out vec3 vW;
+void main(){
+  vec3 p = iPosSize.xyz;
+  float s = iPosSize.w;
+  vec3 R, U;
+  if(iVelStr.w > 0.01){
+    // velocity aligned (tracers, spray streaks)
+    vec3 ax = normalize(iVelStr.xyz + vec3(1e-5));
+    vec3 vd = normalize(p - uCam);
+    U = ax*s*iVelStr.w;
+    R = normalize(cross(ax, vd))*s;
+  } else {
+    float c = cos(iMisc.x), sn = sin(iMisc.x);
+    R = (uCamR*c + uCamU*sn)*s;
+    U = (uCamU*c - uCamR*sn)*s;
+  }
+  vec3 w = p + R*aCorner.x + U*aCorner.y;
+  vW = w;
+  float ti = iMisc.y;
+  vec2 tuv = (aCorner*0.5+0.5)*0.5 + vec2(mod(ti,2.0)*0.5, floor(ti*0.5)*0.5);
+  vUv = tuv; vCol = iCol; vSoft = iMisc.z; vEmis = iMisc.w;
+  gl_Position = uVP*vec4(w,1.0);
+}`;
+const FS_PART = G_HEAD + G_ENV + `
+in vec2 vUv; in vec4 vCol; in float vSoft; in float vEmis; in vec3 vW;
+layout(location=0) out vec4 oCol;
+uniform sampler2D uAtlas;
+uniform sampler2D uSceneD;
+uniform vec2 uInvRes;
+uniform float uNear; uniform float uFar;
+float linZ(float d){ float z=d*2.0-1.0; return (2.0*uNear*uFar)/(uFar+uNear - z*(uFar-uNear)); }
+void main(){
+  vec4 t = texture(uAtlas, vUv);
+  float a = t.a*vCol.a;
+  if(a < 0.004) discard;
+  // soft particles: fade where they intersect opaque geometry
+  if(vSoft > 0.5){
+    vec2 suv = gl_FragCoord.xy*uInvRes;
+    float zs = linZ(texture(uSceneD, suv).r);
+    float zp = linZ(gl_FragCoord.z);
+    a *= clamp((zs - zp)*0.45, 0.0, 1.0);
+  }
+  vec3 c = vCol.rgb*t.rgb;
+  float dist = length(uCam - vW);
+  if(vEmis < 0.5){
+    // lit/atmospheric particle: cheap wrap lighting + fog
+    float wrap = clamp(dot(normalize(vW - uCam), -uSun)*0.5+0.5, 0.0, 1.0);
+    c *= mix(uSkyDn*1.1, uSkyUp + uSunCol*0.35, wrap*0.6+0.25);
+    c = applyFog(c, normalize(vW-uCam), dist);
+  }
+  oCol = vec4(c*a, a);      // premultiplied
+}`;
+
+/* ------------------------------ post -------------------------------- */
+const FS_BRIGHT = G_HEAD + `
+in vec2 vUv;
+layout(location=0) out vec4 oCol;
+uniform sampler2D uSrc; uniform vec2 uTexel; uniform float uThresh; uniform float uKnee;
+void main(){
+  vec3 s = vec3(0.0);
+  s += texture(uSrc, vUv + uTexel*vec2(-1.0,-1.0)).rgb;
+  s += texture(uSrc, vUv + uTexel*vec2( 1.0,-1.0)).rgb;
+  s += texture(uSrc, vUv + uTexel*vec2(-1.0, 1.0)).rgb;
+  s += texture(uSrc, vUv + uTexel*vec2( 1.0, 1.0)).rgb;
+  s *= 0.25;
+  float l = max(s.r, max(s.g, s.b));
+  float soft = clamp(l - uThresh + uKnee, 0.0, 2.0*uKnee);
+  soft = soft*soft/(4.0*uKnee + 1e-4);
+  float w = max(soft, l - uThresh)/max(l, 1e-4);
+  oCol = vec4(s*w, 1.0);
+}`;
+
+const FS_BLUR = G_HEAD + `
+in vec2 vUv;
+layout(location=0) out vec4 oCol;
+uniform sampler2D uSrc; uniform vec2 uDir;
+void main(){
+  vec3 c = texture(uSrc, vUv).rgb*0.2270270;
+  c += (texture(uSrc, vUv + uDir*1.3846153).rgb + texture(uSrc, vUv - uDir*1.3846153).rgb)*0.3162162;
+  c += (texture(uSrc, vUv + uDir*3.2307692).rgb + texture(uSrc, vUv - uDir*3.2307692).rgb)*0.0702702;
+  oCol = vec4(c, 1.0);
+}`;
+
+const FS_UP = G_HEAD + `
+in vec2 vUv;
+layout(location=0) out vec4 oCol;
+uniform sampler2D uSrc; uniform sampler2D uAdd; uniform float uMul;
+void main(){ oCol = vec4(texture(uSrc,vUv).rgb + texture(uAdd,vUv).rgb*uMul, 1.0); }`;
+
+const FS_COMPOSITE = G_HEAD + `
+in vec2 vUv;
+layout(location=0) out vec4 oCol;
+uniform sampler2D uScene;
+uniform sampler2D uBloom;
+uniform sampler2D uDepth;
+uniform mat4  uInvVP;
+uniform mat4  uPrevVP;
+uniform vec2  uRes;
+uniform float uNear, uFar;
+uniform float uExposure;
+uniform float uBloomAmt;
+uniform float uMotion;      // motion blur strength
+uniform float uDofNear, uDofFar, uDofAmt;
+uniform float uVig;
+uniform float uCA;
+uniform float uGrain;
+uniform float uTime;
+uniform float uSat, uContrast;
+uniform vec3  uLift, uGain;
+uniform float uFlash;
+
+float linZ(float d){ float z=d*2.0-1.0; return (2.0*uNear*uFar)/(uFar+uNear - z*(uFar-uNear)); }
+vec3 aces(vec3 x){
+  const float a=2.51,b=0.03,c=2.43,d=0.59,e=0.14;
+  return clamp((x*(a*x+b))/(x*(c*x+d)+e), 0.0, 1.0);
+}
+float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*0.1031); p3 += dot(p3, p3.yzx+33.33); return fract((p3.x+p3.y)*p3.z); }
+
+void main(){
+  vec2 uv = vUv;
+  float dep = texture(uDepth, uv).r;
+  float lz = linZ(dep);
+
+  /* --- reconstruct world position -> previous frame clip -> velocity --- */
+  vec4 hp = uInvVP*vec4(uv*2.0-1.0, dep*2.0-1.0, 1.0);
+  vec3 wp = hp.xyz/hp.w;
+  vec4 pp = uPrevVP*vec4(wp,1.0);
+  vec2 puv = (pp.xy/max(pp.w,1e-4))*0.5+0.5;
+  vec2 vel = (uv - puv)*uMotion;
+  float vl = length(vel);
+  vel = vl > 0.055 ? vel*(0.055/vl) : vel;      // clamp streak length
+
+  /* --- depth of field circle of confusion --- */
+  float coc = 0.0;
+  coc += smoothstep(uDofFar, uDofFar*2.6, lz)*uDofAmt;
+  coc += smoothstep(uDofNear, 0.02, lz)*uDofAmt*1.5;
+  coc = min(coc, 0.02);
+
+  vec3 col = vec3(0.0);
+  float wsum = 0.0;
+  const int TAPS = 8;
+  float jitter = hash12(gl_FragCoord.xy + uTime);
+  for(int i=0;i<TAPS;i++){
+    float t = (float(i)+jitter)/float(TAPS);
+    vec2 off = vel*(t-0.5);
+    float ang = t*6.2831853 + jitter*6.2831853;
+    off += vec2(cos(ang), sin(ang))*coc;
+    float w = 1.0;
+    col += texture(uScene, clamp(uv+off, vec2(0.0), vec2(1.0))).rgb*w;
+    wsum += w;
+  }
+  col /= wsum;
+
+  /* --- chromatic aberration towards the edges (scales with speed) --- */
+  vec2 d = uv - 0.5;
+  float ca = uCA*(0.35 + dot(d,d)*2.2);
+  if(ca > 0.0002){
+    col.r = texture(uScene, clamp(uv + d*ca, vec2(0.0), vec2(1.0))).r;
+    col.b = texture(uScene, clamp(uv - d*ca, vec2(0.0), vec2(1.0))).b;
+  }
+
+  col += texture(uBloom, uv).rgb*uBloomAmt;
+  col *= uExposure;
+  col += uFlash;
+
+  /* --- grade + tonemap --- */
+  float l = dot(col, vec3(0.2126,0.7152,0.0722));
+  col = mix(vec3(l), col, uSat);
+  col = col*uGain + uLift;
+  col = mix(col, col*col*(3.0-2.0*col), uContrast);
+  vec3 shadowT = vec3(0.88, 0.98, 1.12), highT = vec3(1.07, 1.0, 0.93);
+  col *= mix(shadowT, highT, smoothstep(0.0, 0.6, l));
+  col = aces(col);
+  col = pow(max(col, 0.0), vec3(0.45454545));   // linear -> display
+
+  /* --- vignette + grain (display space) --- */
+  float v = 1.0 - uVig*dot(d,d)*1.9;
+  col *= clamp(v, 0.0, 1.0);
+  float g = hash12(gl_FragCoord.xy + fract(uTime)*311.7)-0.5;
+  col += g*uGrain*(1.0 - l*0.7);
+
+  oCol = vec4(max(col, 0.0), 1.0);
+}`;

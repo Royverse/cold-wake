@@ -1,0 +1,414 @@
+/* ============================ 09 audio ============================= */
+/* Low, soft, spy James Bond theme with urban hip-hop aesthetic & calm vibes.
+   All harsh engine & noise synths replaced with warm, lo-fi suppressed tones. */
+
+const AU = {
+  ok: false, ctx: null, t: 0,
+  master: null, busSfx: null, busEng: null, busAmb: null, busMus: null, busVerb: null,
+  noiseBuf: null, irBuf: null,
+  windG: null, waterG: null, droneG: null, pulseT: 0, combat: 0,
+  lastShot: 0,
+
+  // Music sequencer state
+  bpm: 84,
+  step: 0,
+  nextNoteTime: 0,
+  seqTimer: null,
+
+  init() {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return false;
+    try { this.ctx = new AC({ latencyHint: 'interactive' }); } catch (e) { return false; }
+    const c = this.ctx;
+    this.master = c.createGain(); this.master.gain.value = 0.0001;
+    const comp = c.createDynamicsCompressor();
+    comp.threshold.value = -16; comp.knee.value = 24; comp.ratio.value = 4;
+    comp.attack.value = .008; comp.release.value = .25;
+    this.master.connect(comp); comp.connect(c.destination);
+
+    const bus = v => { const g = c.createGain(); g.gain.value = v; g.connect(this.master); return g; };
+    this.busSfx = bus(0.45);   // Soft, non-harsh SFX
+    this.busEng = bus(0.06);   // Whisper quiet electric hull glide
+    this.busAmb = bus(0.18);   // Calm warm atmosphere
+    this.busMus = bus(0.75);   // Spy hip-hop music front & center
+
+    // Warm spatial reverb
+    this.irBuf = this._mkIR(2.2, 3.0);
+    const cv = c.createConvolver(); cv.buffer = this.irBuf;
+    this.busVerb = c.createGain(); this.busVerb.gain.value = .28;
+    this.busVerb.connect(cv); cv.connect(this.master);
+
+    this.noiseBuf = this._mkNoise(3);
+    this._ambience();
+    this.ok = true;
+    this._startMusic();
+    return true;
+  },
+
+  resume() {
+    if (this.ok && this.ctx.state === 'suspended') {
+      this.ctx.resume();
+    }
+  },
+  suspend() {
+    if (this.ok && this.ctx.state === 'running') {
+      this.ctx.suspend();
+    }
+  },
+  fadeIn(v, t) {
+    if (!this.ok) return;
+    this.master.gain.cancelScheduledValues(this.ctx.currentTime);
+    this.master.gain.setTargetAtTime(v, this.ctx.currentTime, t || .4);
+  },
+
+  _mkNoise(sec) {
+    const c = this.ctx, n = (c.sampleRate * sec) | 0;
+    const b = c.createBuffer(1, n, c.sampleRate), d = b.getChannelData(0);
+    let last = 0;
+    for (let i = 0; i < n; i++) {
+      const w = Math.random() * 2 - 1;
+      last = (last + 0.02 * w) / 1.02;
+      d[i] = last * 1.5; // Soft pinkish noise
+    }
+    return b;
+  },
+
+  _mkIR(sec, decay) {
+    const c = this.ctx, n = (c.sampleRate * sec) | 0;
+    const b = c.createBuffer(2, n, c.sampleRate);
+    for (let ch = 0; ch < 2; ch++) {
+      const d = b.getChannelData(ch);
+      for (let i = 0; i < n; i++) {
+        const t = i / n;
+        d[i] = (Math.random() * 2 - 1) * Math.pow(1 - t, decay) * 0.35;
+      }
+    }
+    return b;
+  },
+
+  _noise(loop) {
+    const s = this.ctx.createBufferSource();
+    s.buffer = this.noiseBuf; s.loop = !!loop;
+    return s;
+  },
+
+  _panner(p) {
+    const q = this.ctx.createPanner();
+    q.panningModel = 'equalpower'; q.distanceModel = 'inverse';
+    q.refDistance = 12; q.maxDistance = 600; q.rolloffFactor = 1.0;
+    this._pos(q, p);
+    return q;
+  },
+
+  _pos(q, p) {
+    if (!isFinite(p[0]) || !isFinite(p[1]) || !isFinite(p[2])) return;
+    if (q.positionX) {
+      const t = this.ctx.currentTime;
+      q.positionX.setValueAtTime(p[0], t);
+      q.positionY.setValueAtTime(p[1], t);
+      q.positionZ.setValueAtTime(p[2], t);
+    } else q.setPosition(p[0], p[1], p[2]);
+  },
+
+  setListener(p, fwd, up) {
+    if (!this.ok) return;
+    const l = this.ctx.listener, t = this.ctx.currentTime;
+    if (l.positionX) {
+      l.positionX.setTargetAtTime(p[0], t, .01); l.positionY.setTargetAtTime(p[1], t, .01); l.positionZ.setTargetAtTime(p[2], t, .01);
+      l.forwardX.setTargetAtTime(fwd[0], t, .01); l.forwardY.setTargetAtTime(fwd[1], t, .01); l.forwardZ.setTargetAtTime(fwd[2], t, .01);
+      l.upX.setTargetAtTime(up[0], t, .01); l.upY.setTargetAtTime(up[1], t, .01); l.upZ.setTargetAtTime(up[2], t, .01);
+    } else if (l.setPosition) { l.setPosition(p[0], p[1], p[2]); l.setOrientation(fwd[0], fwd[1], fwd[2], up[0], up[1], up[2]); }
+  },
+
+  _env(node, t0, a, d, peak) {
+    node.gain.setValueAtTime(0.0001, t0);
+    node.gain.linearRampToValueAtTime(peak, t0 + a);
+    node.gain.exponentialRampToValueAtTime(0.0001, t0 + a + d);
+  },
+
+  _ambience() {
+    const c = this.ctx;
+    // Gentle warm water glide
+    this.water = this._noise(true);
+    this.waterF = c.createBiquadFilter(); this.waterF.type = 'lowpass';
+    this.waterF.frequency.value = 240; this.waterF.Q.value = .5;
+    this.waterG = c.createGain(); this.waterG.gain.value = 0.02;
+    this.water.connect(this.waterF); this.waterF.connect(this.waterG); this.waterG.connect(this.busAmb);
+    this.water.start();
+
+    // Subtle warm vinyl / tape bed
+    this.droneG = c.createGain(); this.droneG.gain.value = 0.015;
+    const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 160;
+    this.droneG.connect(lp); lp.connect(this.busAmb);
+    const o = c.createOscillator(); o.type = 'sine'; o.frequency.value = 55;
+    o.connect(this.droneG); o.start();
+  },
+
+  /* ================= PROCEDURAL SPY / JAMES BOND HIP-HOP MUSIC ================= */
+  _startMusic() {
+    if (this.seqTimer) clearInterval(this.seqTimer);
+    this.nextNoteTime = this.ctx.currentTime + 0.1;
+    this.step = 0;
+    this.seqTimer = setInterval(() => this._musicScheduler(), 25);
+  },
+
+  _musicScheduler() {
+    if (!this.ok) return;
+    const c = this.ctx;
+    const stepTime = 60 / this.bpm / 4; // 16th note duration (~0.178s at 84 BPM)
+    while (this.nextNoteTime < c.currentTime + 0.12) {
+      this._playStep(this.step, this.nextNoteTime);
+      // Lo-fi swing on odd 16th notes
+      const isOdd = (this.step % 2) !== 0;
+      const swingOffset = isOdd ? 0.022 : -0.01;
+      this.nextNoteTime += stepTime + swingOffset;
+      this.step = (this.step + 1) % 64; // 4-bar loop (64 16th steps)
+    }
+  },
+
+  _playStep(step, t) {
+    const c = this.ctx;
+    const bar = Math.floor(step / 16);
+    const s = step % 16;
+
+    // ----- 1. URBAN LO-FI HIP-HOP DRUMS -----
+    // Warm 808 Kick: Beats 1, 3 (with syncopation on step 10/14)
+    const kickPattern = [1, 0, 0, 0,  0, 0, 0, 0,  1, 0, 1, 0,  0, 0, 0, 0];
+    if (kickPattern[s]) {
+      const osc = c.createOscillator();
+      const g = c.createGain();
+      const lp = c.createBiquadFilter();
+      lp.type = 'lowpass'; lp.frequency.value = 160;
+      osc.frequency.setValueAtTime(68, t);
+      osc.frequency.exponentialRampToValueAtTime(36, t + 0.18);
+      this._env(g, t, 0.003, 0.28, 0.55);
+      osc.connect(lp); lp.connect(g); g.connect(this.busMus);
+      osc.start(t); osc.stop(t + 0.3);
+    }
+
+    // Soft Jazzy Rimshot / Snare: Beats 2 and 4 (steps 4 and 12)
+    if (s === 4 || s === 12) {
+      const o = c.createOscillator(); o.type = 'triangle';
+      o.frequency.setValueAtTime(320, t);
+      o.frequency.exponentialRampToValueAtTime(140, t + 0.06);
+      const g1 = c.createGain(); this._env(g1, t, 0.002, 0.07, 0.28);
+      o.connect(g1); g1.connect(this.busMus);
+      o.start(t); o.stop(t + 0.08);
+
+      const nz = this._noise();
+      const bp = c.createBiquadFilter(); bp.type = 'bandpass';
+      bp.frequency.value = 1400; bp.Q.value = 0.8;
+      const g2 = c.createGain(); this._env(g2, t, 0.002, 0.11, 0.18);
+      nz.connect(bp); bp.connect(g2); g2.connect(this.busMus);
+      nz.start(t); nz.stop(t + 0.14);
+    }
+
+    // Smooth Closed Hi-Hats: 8th notes + subtle 16th groove
+    const hatPattern = [1, 0, 1, 1,  1, 0, 1, 0,  1, 0, 1, 1,  1, 0, 1, 0];
+    if (hatPattern[s]) {
+      const nz = this._noise();
+      const hp = c.createBiquadFilter(); hp.type = 'highpass';
+      hp.frequency.value = 6500;
+      const g = c.createGain();
+      const vol = (s % 4 === 0) ? 0.09 : (s % 2 === 0) ? 0.06 : 0.035;
+      this._env(g, t, 0.001, 0.035, vol);
+      nz.connect(hp); hp.connect(g); g.connect(this.busMus);
+      nz.start(t); nz.stop(t + 0.05);
+    }
+
+    // ----- 2. ICONIC 007 / SPY CHROMATIC BASSLINE -----
+    // Classic James Bond chromatic progression in D: D -> D# -> E -> D#
+    const bassNotes = [36.71, 38.89, 41.20, 38.89]; // D1, D#1, E1, D#1
+    const rootFreq = bassNotes[bar % 4];
+    if (s === 0 || s === 6 || s === 8 || s === 14) {
+      const osc = c.createOscillator(); osc.type = 'sine';
+      const sub = c.createOscillator(); sub.type = 'triangle';
+      const g = c.createGain();
+      const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 240;
+      const dur = (s === 0 || s === 8) ? 0.45 : 0.28;
+      osc.frequency.setValueAtTime(rootFreq, t);
+      sub.frequency.setValueAtTime(rootFreq * 2, t);
+      this._env(g, t, 0.01, dur, 0.52);
+      osc.connect(lp); sub.connect(lp); lp.connect(g); g.connect(this.busMus);
+      osc.start(t); sub.start(t);
+      osc.stop(t + dur + 0.05); sub.stop(t + dur + 0.05);
+    }
+
+    // ----- 3. MELLOW RHODES / VIBES SPY CHORDS -----
+    if (s === 0 || s === 8) {
+      const chordVoicings = [
+        [174.61, 220.00, 261.63, 329.63],
+        [174.61, 220.00, 277.18, 329.63],
+        [174.61, 220.00, 246.94, 329.63],
+        [174.61, 220.00, 277.18, 392.00]
+      ];
+      const chord = chordVoicings[bar % 4];
+      for (let ci = 0; ci < chord.length; ci++) {
+        const o = c.createOscillator(); o.type = 'sine';
+        const o2 = c.createOscillator(); o2.type = 'triangle';
+        const g = c.createGain();
+        const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 850;
+        o.frequency.setValueAtTime(chord[ci], t);
+        o2.frequency.setValueAtTime(chord[ci] * 1.002, t);
+        this._env(g, t + ci * 0.015, 0.02, 1.4, 0.09);
+        o.connect(lp); o2.connect(lp); lp.connect(g); g.connect(this.busMus); g.connect(this.busVerb);
+        o.start(t + ci * 0.015); o2.start(t + ci * 0.015);
+        o.stop(t + 1.6); o2.stop(t + 1.6);
+      }
+    }
+
+    // ----- 4. SIGNATURE SPY THEME MELODIC MOTIF -----
+    const spyLicks = {
+      20: 440.00, // A4
+      23: 415.30, // G#4
+      26: 392.00, // G4
+      28: 370.00, // F#4
+      52: 293.66, // D4
+      55: 311.13, // Eb4
+      58: 329.63, // E4
+      60: 311.13  // Eb4
+    };
+    if (spyLicks[step]) {
+      const noteFreq = spyLicks[step];
+      const o = c.createOscillator(); o.type = 'triangle';
+      const oSin = c.createOscillator(); oSin.type = 'sine';
+      const g = c.createGain();
+      const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1400;
+      o.frequency.setValueAtTime(noteFreq, t);
+      oSin.frequency.setValueAtTime(noteFreq * 2, t);
+      this._env(g, t, 0.012, 0.55, 0.16);
+      o.connect(lp); oSin.connect(lp); lp.connect(g); g.connect(this.busMus); g.connect(this.busVerb);
+      o.start(t); oSin.start(t);
+      o.stop(t + 0.65); oSin.stop(t + 0.65);
+    }
+  },
+
+  /* ---- SILENCED & SOFT SOUND EFFECTS ---- */
+  engineNew(player) {
+    if (!this.ok) return null;
+    const c = this.ctx, e = { g: null, osc: null };
+    e.g = c.createGain(); e.g.gain.value = 0.001;
+    e.osc = c.createOscillator(); e.osc.type = 'sine'; e.osc.frequency.value = 52;
+    e.lp = c.createBiquadFilter(); e.lp.type = 'lowpass'; e.lp.frequency.value = 120;
+    e.osc.connect(e.lp); e.lp.connect(e.g); e.g.connect(this.busEng);
+    e.osc.start();
+    return e;
+  },
+
+  engineSet(e, rpm, load, vol, pos, radialVel) {
+    if (!e || !this.ok) return;
+    const t = this.ctx.currentTime;
+    e.osc.frequency.setTargetAtTime(45 + rpm * 40, t, 0.1);
+    e.g.gain.setTargetAtTime(0.02 + rpm * 0.03, t, 0.1);
+  },
+
+  engineStop(e) {
+    if (!e || !this.ok) return;
+    try { e.osc.stop(); } catch (x) {}
+  },
+
+  // Silenced suppressed pistol "thwip"
+  shot(pos, kind, vol) {
+    if (!this.ok) return;
+    const c = this.ctx, t = c.currentTime;
+    if (t - this.lastShot < 0.04) return;
+    this.lastShot = t;
+    vol = vol === undefined ? 1 : vol;
+    const out = pos ? this._panner(pos) : c.createGain();
+    out.connect(this.busSfx);
+
+    const n = this._noise();
+    const lp = c.createBiquadFilter(); lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(1600, t);
+    lp.frequency.exponentialRampToValueAtTime(280, t + 0.07);
+    const g = c.createGain(); this._env(g, t, 0.001, 0.065, 0.4 * vol);
+    n.connect(lp); lp.connect(g); g.connect(out);
+    n.start(t); n.stop(t + 0.08);
+
+    const o = c.createOscillator(); o.type = 'sine';
+    o.frequency.setValueAtTime(220, t);
+    o.frequency.exponentialRampToValueAtTime(70, t + 0.05);
+    const g2 = c.createGain(); this._env(g2, t, 0.001, 0.045, 0.25 * vol);
+    o.connect(g2); g2.connect(out);
+    o.start(t); o.stop(t + 0.06);
+  },
+
+  whiz(pos) {
+    if (!this.ok) return;
+    const c = this.ctx, t = c.currentTime;
+    const p = this._panner(pos); p.connect(this.busSfx);
+    const o = c.createOscillator(); o.type = 'sine';
+    o.frequency.setValueAtTime(800, t);
+    o.frequency.exponentialRampToValueAtTime(300, t + .12);
+    const g = c.createGain(); this._env(g, t, .004, .10, .10);
+    o.connect(g); g.connect(p); o.start(t); o.stop(t + .14);
+  },
+
+  explosion(pos, power) {
+    if (!this.ok) return;
+    const c = this.ctx, t = c.currentTime;
+    const out = this._panner(pos); out.connect(this.busSfx);
+    const n = this._noise();
+    const lp = c.createBiquadFilter(); lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(400, t);
+    lp.frequency.exponentialRampToValueAtTime(60, t + 0.8 * power);
+    const g = c.createGain(); this._env(g, t, .006, 0.9 * power, 0.45);
+    n.connect(lp); lp.connect(g); g.connect(out);
+    n.start(t); n.stop(t + 1.2);
+  },
+
+  splashSfx(pos, power) {
+    if (!this.ok) return;
+    const c = this.ctx, t = c.currentTime;
+    const out = this._panner(pos); out.connect(this.busSfx);
+    const n = this._noise();
+    const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 500;
+    const g = c.createGain(); this._env(g, t, .006, .25 * (.6 + power), .15 * power);
+    n.connect(lp); lp.connect(g); g.connect(out);
+    n.start(t); n.stop(t + .4);
+  },
+
+  impactSfx(pos, mat) {
+    if (!this.ok) return;
+    const c = this.ctx, t = c.currentTime;
+    const out = this._panner(pos); out.connect(this.busSfx);
+    const n = this._noise();
+    const f = c.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 600;
+    const g = c.createGain(); this._env(g, t, .001, .08, .18);
+    n.connect(f); f.connect(g); g.connect(out);
+    n.start(t); n.stop(t + .12);
+  },
+
+  iceCrack(pos, big) {
+    if (!this.ok) return;
+    const c = this.ctx, t = c.currentTime;
+    const out = this._panner(pos); out.connect(this.busSfx);
+    const n = this._noise();
+    const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 350;
+    const g = c.createGain(); this._env(g, t, .02, big ? 1.2 : 0.4, .25);
+    n.connect(lp); lp.connect(g); g.connect(out);
+    n.start(t); n.stop(t + 1.4);
+  },
+
+  ui(kind) {
+    if (!this.ok) return;
+    const c = this.ctx, t = c.currentTime;
+    const g = c.createGain(); g.connect(this.busSfx);
+    const o = c.createOscillator(); o.type = 'sine';
+    const F = { 0: 520, 1: 660, 2: 440, 3: 1100, 4: 160 }[kind] || 520;
+    o.frequency.setValueAtTime(F, t);
+    this._env(g, t, .002, .06, .12);
+    o.connect(g); o.start(t); o.stop(t + .09);
+  },
+
+  bark() {
+    // Radio voice buzz muted for calm vibes
+  },
+
+  mix(dt, speed, combat, inCave) {
+    if (!this.ok) return;
+    const t = this.ctx.currentTime;
+    const sp = clamp(speed / 55, 0, 1.3);
+    this.waterG.gain.setTargetAtTime(0.015 + sp * 0.04, t, .2);
+  },
+};

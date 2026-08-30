@@ -1,0 +1,290 @@
+
+/* ============================ 03 glsl ============================== */
+/* Shared GLSL chunks. Everything is forward-shaded with one directional
+   light, an analytic sky for ambient/IBL, one shadow cascade and exp fog. */
+
+const G_HEAD = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+`;
+
+const G_ENV = `
+uniform vec3  uSun;        // unit vector TOWARDS the sun
+uniform vec3  uSunCol;
+uniform vec3  uSkyUp;
+uniform vec3  uSkyDn;
+uniform vec3  uFogCol;
+uniform float uFogDen;
+uniform float uTime;
+uniform vec3  uCam;
+uniform sampler2D uNoise;
+
+float n2(vec2 p){ return texture(uNoise, p).r; }
+float n2f(vec2 p){ return texture(uNoise, p).g; }
+float fbm2(vec2 p){
+  float s = 0.0, a = 0.5;
+  for(int i=0;i<4;i++){ s += a*n2(p); p = p*2.03 + vec2(0.137,0.271); a *= 0.5; }
+  return s;
+}
+vec3 skyColor(vec3 rd){
+  float y = rd.y;
+  float t = pow(clamp(1.0 - abs(y), 0.0, 1.0), 2.6);
+  vec3 col = mix(uSkyUp, uSkyDn, t*0.92);
+  col = mix(col, uFogCol*0.92, smoothstep(0.08, -0.3, y));
+  float mu = max(dot(rd, uSun), 0.0);
+  col += uSunCol * (pow(mu, 5.0)*0.10 + pow(mu, 48.0)*0.30);
+  return col;
+}
+vec3 applyFog(vec3 col, vec3 rd, float dist){
+  float f = 1.0 - exp(-pow(max(dist,0.0)*uFogDen, 1.32));
+  float mu = max(dot(rd, uSun), 0.0);
+  vec3 fc = uFogCol + uSunCol*pow(mu, 10.0)*0.35;
+  // thin altitude falloff so the tops of the cliffs stay a little clearer
+  return mix(col, fc, clamp(f, 0.0, 1.0));
+}
+`;
+
+const G_PBR = `
+float D_GGX(float NoH, float a){ float a2=a*a; float d=NoH*NoH*(a2-1.0)+1.0; return a2/(3.14159265*d*d+1e-7); }
+float V_Smith(float NoV, float NoL, float a){
+  float a2=a*a;
+  float gv = NoL*sqrt(NoV*NoV*(1.0-a2)+a2);
+  float gl = NoV*sqrt(NoL*NoL*(1.0-a2)+a2);
+  return 0.5/max(gv+gl, 1e-5);
+}
+vec3 F_S(vec3 f0, float u){ return f0 + (vec3(1.0)-f0)*pow(1.0-u, 5.0); }
+vec3 shadePBR(vec3 N, vec3 V, vec3 albedo, float rough, float metal, float ao, float sh){
+  vec3 L = uSun, H = normalize(L+V);
+  float NoL = max(dot(N,L),0.0), NoV = max(dot(N,V),1e-4);
+  float NoH = max(dot(N,H),0.0), VoH = max(dot(V,H),0.0);
+  float a = max(rough*rough, 0.0025);
+  vec3 f0 = mix(vec3(0.04), albedo, metal);
+  vec3 diff = albedo*(1.0-metal)*0.31831;
+  vec3 spec = F_S(f0,VoH)*D_GGX(NoH,a)*V_Smith(NoV,NoL,a);
+  vec3 direct = (diff+spec)*uSunCol*NoL*sh;
+  float hemi = N.y*0.5+0.5;
+  vec3 amb = mix(uSkyDn, uSkyUp, hemi)*albedo*(1.0-metal)*ao;
+  vec3 R = reflect(-V,N);
+  vec3 ambS = skyColor(R)*F_S(f0,NoV)*(1.0-rough*0.8)*ao;
+  return direct + amb*0.60 + ambS*0.42;
+}
+`;
+
+const G_SHADOW = `
+uniform sampler2D uShadow;
+uniform mat4  uShadowMat;
+uniform float uShadowTexel;
+uniform float uShadowOn;
+float shadowAt(vec3 wp, float NoL){
+  if(uShadowOn < 0.5) return 1.0;
+  vec4 sp = uShadowMat*vec4(wp,1.0);
+  vec3 p = sp.xyz/sp.w*0.5+0.5;
+  if(p.x<0.004||p.x>0.996||p.y<0.004||p.y>0.996||p.z>1.0) return 1.0;
+  float bias = mix(0.0035, 0.0006, NoL);
+  float s = 0.0;
+  for(int y=-1;y<=1;y++)
+    for(int x=-1;x<=1;x++){
+      float d = texture(uShadow, p.xy + vec2(float(x),float(y))*uShadowTexel).r;
+      s += p.z-bias < d ? 1.0 : 0.0;
+    }
+  return s/9.0;
+}
+`;
+
+/* ---------------------------- sky ---------------------------------- */
+const VS_FS = G_HEAD + `
+out vec2 vUv;
+void main(){
+  vec2 p = vec2(float((gl_VertexID<<1)&2), float(gl_VertexID&2));
+  vUv = p;
+  gl_Position = vec4(p*2.0-1.0, 1.0, 1.0);
+}`;
+
+const FS_SKY = G_HEAD + G_ENV + `
+in vec2 vUv;
+layout(location=0) out vec4 oCol;
+uniform mat4  uInvVP;
+uniform float uCloudCover;
+uniform float uSnowMix;
+
+/* cheap layered cloud slabs: 3 parallax planes with a 2-tap light term */
+float cloudLayer(vec3 rd, float h, float scale, float t, out float lit){
+  lit = 0.0;
+  if(rd.y < 0.015) return 0.0;
+  float d = h/rd.y;
+  vec2 p = (uCam.xz + rd.xz*d)*scale + vec2(t*0.004, t*0.0016);
+  float n = fbm2(p);
+  float n2_ = fbm2(p*2.7 + vec2(n*0.6));
+  float dens = smoothstep(0.52 - uCloudCover*0.22, 0.86, n*0.72 + n2_*0.28);
+  // light march: sample once towards the sun for a silver lining
+  vec2 ls = p + uSun.xz*0.06;
+  float nl = fbm2(ls)*0.72 + fbm2(ls*2.7)*0.28;
+  lit = clamp(1.0 - smoothstep(0.45, 0.85, nl), 0.0, 1.0);
+  float fade = smoothstep(0.015, 0.10, rd.y);
+  return dens*fade;
+}
+
+void main(){
+  vec4 hp = uInvVP*vec4(vUv*2.0-1.0, 1.0, 1.0);
+  vec3 rd = normalize(hp.xyz/hp.w - uCam);
+
+  vec3 col = skyColor(rd);
+  // sun disc with soft limb
+  float mu = dot(rd, uSun);
+  col += uSunCol*smoothstep(0.9993, 0.99975, mu)*7.0;
+
+  /* distant massif silhouettes (three ridgelines at infinity) */
+  float az = atan(rd.z, rd.x);
+  for(int i=0;i<3;i++){
+    float fi = float(i);
+    float freq = 1.6 + fi*2.1;
+    float rl = fbm2(vec2(az*freq*0.16 + fi*7.3, 0.31))*0.9 + fbm2(vec2(az*freq*0.5 + fi*3.1, 0.77))*0.35;
+    float top = 0.012 + rl*(0.115 - fi*0.028);
+    float m = smoothstep(top+0.0015, top-0.0015, rd.y);
+    vec3 mc = mix(uFogCol*0.62, uFogCol*0.95, fi*0.5);
+    mc *= 0.82 + 0.2*fbm2(vec2(az*9.0, rd.y*40.0));
+    col = mix(col, mc, m*(0.92 - fi*0.14)*smoothstep(-0.05, 0.02, rd.y));
+  }
+
+  /* clouds */
+  float l1, l2, l3;
+  float c1 = cloudLayer(rd, 900.0, 0.00030, uTime, l1);
+  float c2 = cloudLayer(rd, 1500.0, 0.00018, uTime*1.35, l2);
+  float c3 = cloudLayer(rd, 2600.0, 0.00010, uTime*1.8, l3);
+  vec3 cbase = mix(uSkyDn*0.48, vec3(0.46,0.52,0.60), 0.40);
+  vec3 c1c = mix(cbase*0.72, cbase + uSunCol*0.35, l1);
+  vec3 c2c = mix(cbase*0.80, cbase + uSunCol*0.45, l2);
+  vec3 c3c = mix(cbase*0.90, cbase + uSunCol*0.55, l3);
+  col = mix(col, c3c, c3*0.55);
+  col = mix(col, c2c, c2*0.7);
+  col = mix(col, c1c, c1*0.85);
+
+  /* snow squall haze near the horizon */
+  float squall = smoothstep(0.35, -0.05, rd.y)*uSnowMix;
+  col = mix(col, uFogCol*1.05, squall*0.55);
+
+  oCol = vec4(col, 1.0);
+}`;
+
+/* --------------------------- terrain -------------------------------- */
+const VS_TERRAIN = G_HEAD + `
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNrm;
+layout(location=2) in vec2 aInfo;   // x: snow weight  y: baked cavity AO
+uniform mat4 uVP;
+out vec3 vW; out vec3 vN; out vec2 vI;
+void main(){
+  vW = aPos; vN = aNrm; vI = aInfo;
+  gl_Position = uVP*vec4(aPos,1.0);
+}`;
+
+const FS_TERRAIN = G_HEAD + G_ENV + G_PBR + G_SHADOW + `
+in vec3 vW; in vec3 vN; in vec2 vI;
+layout(location=0) out vec4 oCol;
+uniform float uClip;      // >0.5 -> reflection pass, kill anything under water
+
+void main(){
+  if(uClip > 0.5 && vW.y < -0.35) discard;
+  vec3 N = normalize(vN);
+  vec3 dv = uCam - vW;
+  float dist = length(dv);
+  vec3 V = dv/max(dist,1e-4);
+
+  /* --- procedural detail: ice striations on walls, drift ripples on snow --- */
+  vec2 uvA = vW.xz*0.055;
+  vec2 uvB = vec2(vW.y*0.09 + vW.x*0.012, vW.z*0.028);
+  float dtA = fbm2(uvA);
+  float dtB = n2(uvB*1.7);
+  float grain = n2(vW.xz*0.9 + vW.y*0.35);
+
+  // perturb normal (cheap analytic bump from two noise samples)
+  vec2 e = vec2(0.35, 0.0);
+  float h0 = dtA*0.55 + dtB*0.45;
+  float hx = fbm2(uvA + e.xy*0.055)*0.55 + n2(uvB + e.xy*0.09)*0.45;
+  float hz = fbm2(uvA + e.yx*0.055)*0.55 + n2(uvB + e.yx*0.09)*0.45;
+  vec3 bump = vec3(h0-hx, 0.85, h0-hz);
+  float bumpAmt = mix(1.4, 0.35, vI.x);
+  N = normalize(N + vec3(bump.x, 0.0, bump.z)*bumpAmt*clamp(1.0-dist*0.004, 0.15, 1.0));
+
+  /* --- material blend: dark wet rock -> ice -> snow --- */
+  float up = clamp(N.y, 0.0, 1.0);
+  float snowW = clamp(vI.x*0.75 + smoothstep(0.55, 0.88, up)*0.75 - dtA*0.35, 0.0, 1.0);
+  snowW = smoothstep(0.22, 0.62, snowW);
+
+  vec3 rock = mix(vec3(0.030,0.035,0.042), vec3(0.075,0.084,0.096), dtA);
+  rock = mix(rock, vec3(0.055,0.085,0.115), smoothstep(0.4,0.9,dtB)*0.5);   // wet basalt
+  vec3 ice  = mix(vec3(0.24,0.36,0.45), vec3(0.46,0.60,0.70), dtB);
+  vec3 snow = mix(vec3(0.56,0.63,0.74), vec3(0.76,0.83,0.92), grain);
+
+  float iceW = smoothstep(0.30, 0.75, vI.x)*(1.0-snowW)*0.85;
+  vec3 albedo = mix(rock, ice, iceW);
+  albedo = mix(albedo, snow, snowW);
+
+  float rough = mix(mix(0.82, 0.30, iceW), 0.62, snowW);
+  float ao = clamp(vI.y, 0.0, 1.0);
+  ao *= mix(0.75, 1.0, up);
+
+  float NoL = max(dot(N, uSun), 0.0);
+  float sh = shadowAt(vW, NoL);
+
+  vec3 col = shadePBR(N, V, albedo, rough, 0.0, ao, sh);
+
+  /* snow sparkle - tiny specular glints that twinkle with view angle */
+  float spark = pow(n2(vW.xz*3.7 + vW.y*1.3), 22.0);
+  col += vec3(0.85,0.93,1.0)*spark*snowW*sh*2.2*max(dot(N,uSun),0.0);
+
+  /* subsurface-ish blue bounce in shadowed ice */
+  col += vec3(0.10,0.19,0.30)*iceW*(1.0-sh)*0.35;
+
+  col = applyFog(col, -V, dist);
+  oCol = vec4(col, 1.0);
+}`;
+
+/* ----------------------------- props -------------------------------- */
+/* Shared by every rigid mesh: hulls, riders, drums, ice blocks, rotors. */
+const VS_PROP = G_HEAD + `
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNrm;
+layout(location=2) in vec3 aCol;
+layout(location=3) in float aRough;
+uniform mat4 uVP; uniform mat4 uModel;
+out vec3 vW; out vec3 vN; out vec3 vC; out float vR;
+void main(){
+  vec4 w = uModel*vec4(aPos,1.0);
+  vW = w.xyz;
+  vN = mat3(uModel)*aNrm;
+  vC = aCol; vR = aRough;
+  gl_Position = uVP*w;
+}`;
+
+const FS_PROP = G_HEAD + G_ENV + G_PBR + G_SHADOW + `
+in vec3 vW; in vec3 vN; in vec3 vC; in float vR;
+layout(location=0) out vec4 oCol;
+uniform vec3  uTint;
+uniform float uMetal;
+uniform float uEmis;
+uniform vec3  uEmisCol;
+uniform float uClip;
+uniform float uAlpha;
+void main(){
+  if(uClip > 0.5 && vW.y < -0.35) discard;
+  vec3 N = normalize(vN);
+  vec3 dv = uCam - vW; float dist = length(dv); vec3 V = dv/max(dist,1e-4);
+  if(!gl_FrontFacing) N = -N;
+  vec3 albedo = vC*uTint;
+  float NoL = max(dot(N,uSun),0.0);
+  float sh = shadowAt(vW, NoL);
+  vec3 col = shadePBR(N, V, albedo, clamp(vR,0.04,1.0), uMetal, 1.0, sh);
+  col += uEmisCol*uEmis;
+  col = applyFog(col, -V, dist);
+  oCol = vec4(col, uAlpha);
+}`;
+
+/* --------------------------- shadow pass ----------------------------- */
+const VS_SHADOW = G_HEAD + `
+layout(location=0) in vec3 aPos;
+uniform mat4 uVP; uniform mat4 uModel;
+void main(){ gl_Position = uVP*(uModel*vec4(aPos,1.0)); }`;
+const FS_SHADOW = G_HEAD + `
+layout(location=0) out vec4 oCol;
+void main(){ oCol = vec4(1.0); }`;

@@ -1,0 +1,241 @@
+
+/* ============================ 01 gl ================================ */
+const canvas = $('view');
+let gl = null;
+function fatal(msg) {
+  const e = $('err'); e.style.display = 'flex';
+  e.innerHTML = msg + '<br><br><span style="color:#dff3ec;opacity:.5">COLD WAKE requires a WebGL 2 capable browser.</span>';
+  document.querySelectorAll('.screen').forEach(s => s.classList.add('off'));
+  throw new Error(msg);
+}
+try {
+  gl = canvas.getContext('webgl2', {
+    alpha: false, antialias: false, depth: true, stencil: false,
+    powerPreference: 'high-performance', preserveDrawingBuffer: false, desynchronized: true
+  });
+} catch (e) { /* handled below */ }
+if (!gl) fatal('GRAPHICS CONTEXT FAILED');
+
+/** capability probe -> drives graceful degradation of the post stack */
+const CAPS = {
+  colorFloat: !!gl.getExtension('EXT_color_buffer_float'),
+  floatLinear: !!gl.getExtension('OES_texture_float_linear'),
+  aniso: null, anisoMax: 1,
+  maxTex: gl.getParameter(gl.MAX_TEXTURE_SIZE),
+};
+CAPS.aniso = gl.getExtension('EXT_texture_filter_anisotropic');
+if (CAPS.aniso) CAPS.anisoMax = min(8, gl.getParameter(CAPS.aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT));
+/** HDR colour format: 16F when renderable, otherwise 8bit (bloom still works, less range) */
+const HDR = CAPS.colorFloat ? { i: gl.RGBA16F, f: gl.RGBA, t: gl.HALF_FLOAT } : { i: gl.RGBA8, f: gl.RGBA, t: gl.UNSIGNED_BYTE };
+
+/** compile + link with readable errors; caches uniform locations */
+class Shader {
+  constructor(vsSrc, fsSrc, name) {
+    this.name = name || 'shader';
+    const vs = this._c(gl.VERTEX_SHADER, vsSrc), fs = this._c(gl.FRAGMENT_SHADER, fsSrc);
+    const p = gl.createProgram();
+    gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) fatal('LINK ' + this.name + ': ' + gl.getProgramInfoLog(p));
+    gl.deleteShader(vs); gl.deleteShader(fs);
+    this.p = p; this.u = new Map(); this.unit = 0;
+  }
+  _c(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(s) || '';
+      const ln = /ERROR:\s*\d+:(\d+)/.exec(log);
+      let ctx = '';
+      if (ln) {
+        const lines = src.split('\n'), i = +ln[1] - 1;
+        ctx = lines.slice(max(0, i - 3), i + 3).join('\n');
+      }
+      fatal('COMPILE ' + this.name + ':<br><pre style="text-align:left;font-size:11px">' + log + '\n' + ctx + '</pre>');
+    }
+    return s;
+  }
+  use() { gl.useProgram(this.p); this.unit = 0; return this; }
+  l(n) { let x = this.u.get(n); if (x === undefined) { x = gl.getUniformLocation(this.p, n); this.u.set(n, x); } return x; }
+  f(n, v) { gl.uniform1f(this.l(n), v); return this; }
+  i(n, v) { gl.uniform1i(this.l(n), v); return this; }
+  v2(n, a, b) { gl.uniform2f(this.l(n), a, b); return this; }
+  v3(n, a, b, c) { if (b === undefined) gl.uniform3f(this.l(n), a[0], a[1], a[2]); else gl.uniform3f(this.l(n), a, b, c); return this; }
+  v4(n, a, b, c, d) { gl.uniform4f(this.l(n), a, b, c, d); return this; }
+  m4(n, m) { gl.uniformMatrix4fv(this.l(n), false, m); return this; }
+  fv(n, arr) { gl.uniform1fv(this.l(n), arr); return this; }
+  v4v(n, arr) { gl.uniform4fv(this.l(n), arr); return this; }
+  tex(n, t, target) {
+    const u = this.unit++;
+    gl.activeTexture(gl.TEXTURE0 + u);
+    gl.bindTexture(target || gl.TEXTURE_2D, t);
+    gl.uniform1i(this.l(n), u); return this;
+  }
+}
+
+function mkTex(w, h, o) {
+  o = o || {};
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, o.i || gl.RGBA8, w, h, 0, o.f || gl.RGBA, o.t || gl.UNSIGNED_BYTE, o.data || null);
+  const filt = o.filter === undefined ? gl.LINEAR : o.filter;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, o.mip ? gl.LINEAR_MIPMAP_LINEAR : filt);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filt);
+  const wrap = o.wrap || gl.CLAMP_TO_EDGE;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
+  if (o.cmp) {
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_MODE, gl.COMPARE_REF_TO_TEXTURE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_FUNC, gl.LEQUAL);
+  }
+  if (o.mip) gl.generateMipmap(gl.TEXTURE_2D);
+  if (o.aniso && CAPS.aniso) gl.texParameterf(gl.TEXTURE_2D, CAPS.aniso.TEXTURE_MAX_ANISOTROPY_EXT, CAPS.anisoMax);
+  t.w = w; t.h = h;
+  return t;
+}
+/** framebuffer wrapper: {fb,color,depth,w,h} */
+function mkFbo(w, h, opt) {
+  opt = opt || {};
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  let color = null, depth = null;
+  if (opt.color !== false) {
+    color = mkTex(w, h, { i: opt.i || HDR.i, f: opt.f || HDR.f, t: opt.t || HDR.t, filter: opt.filter });
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, color, 0);
+  } else { gl.drawBuffers([gl.NONE]); gl.readBuffer(gl.NONE); }
+  if (opt.depth) {
+    depth = mkTex(w, h, { i: gl.DEPTH_COMPONENT24, f: gl.DEPTH_COMPONENT, t: gl.UNSIGNED_INT, filter: gl.NEAREST });
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depth, 0);
+  }
+  const st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if (st !== gl.FRAMEBUFFER_COMPLETE) console.warn('fbo incomplete', st.toString(16));
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { fb, color, depth, w, h };
+}
+function delFbo(f) { if (!f) return; gl.deleteFramebuffer(f.fb); if (f.color) gl.deleteTexture(f.color); if (f.depth) gl.deleteTexture(f.depth); }
+
+/** vertex-id driven fullscreen triangle (no attribute buffers needed) */
+const emptyVAO = gl.createVertexArray();
+function drawFS() { gl.bindVertexArray(emptyVAO); gl.drawArrays(gl.TRIANGLES, 0, 3); }
+
+/** build a VAO from an interleaved float buffer + uint indices */
+function mkMeshGL(verts, idx, layout) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const vb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vb);
+  gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+  let stride = 0; for (const a of layout) stride += a.n * 4;
+  let off = 0;
+  for (let i = 0; i < layout.length; i++) {
+    gl.enableVertexAttribArray(i);
+    gl.vertexAttribPointer(i, layout[i].n, gl.FLOAT, false, stride, off);
+    off += layout[i].n * 4;
+  }
+  let ib = null;
+  if (idx) {
+    ib = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+  }
+  gl.bindVertexArray(null);
+  return { vao, vb, ib, count: idx ? idx.length : verts.length / (stride / 4) };
+}
+function delMeshGL(m) { if (!m) return; gl.deleteVertexArray(m.vao); gl.deleteBuffer(m.vb); if (m.ib) gl.deleteBuffer(m.ib); }
+
+/* ============================ 02 textures ========================== */
+/* Every texel in the game is generated here at boot - no external assets. */
+
+/** tiling value noise (period `per` lattice cells) */
+function pnoise(x, y, per) {
+  const xi = floor(x), yi = floor(y), xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const w = (a, b) => { a = ((a % per) + per) % per; b = ((b % per) + per) % per; return ihash(a, b); };
+  const a = w(xi, yi), b = w(xi + 1, yi), c = w(xi, yi + 1), d = w(xi + 1, yi + 1);
+  return lerp(lerp(a, b, u), lerp(c, d, u), v);
+}
+function pfbm(x, y, per, oct) {
+  let s = 0, amp = .5, f = 1, norm = 0;
+  for (let i = 0; i < oct; i++) { s += amp * pnoise(x * f, y * f, per * f); norm += amp; f *= 2; amp *= .5; }
+  return s / norm;
+}
+
+/** RGBA noise atlas: r=coarse fbm  g=fine fbm  b=ridged  a=very fine */
+function makeNoiseTex() {
+  const S = 128, d = new Uint8Array(S * S * 4);
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const u = x / S, v = y / S, i = (y * S + x) * 4;
+    const c = pfbm(u * 8, v * 8, 8, 4);
+    const f = pfbm(u * 24, v * 24, 24, 3);
+    let r = 0, amp = .5, fr = 1, nn = 0;
+    for (let o = 0; o < 4; o++) { r += amp * (1 - abs(pnoise(u * 6 * fr, v * 6 * fr, 6 * fr) * 2 - 1)); nn += amp; fr *= 2; amp *= .5; }
+    d[i] = c * 255; d[i + 1] = f * 255; d[i + 2] = (r / nn) * 255; d[i + 3] = pfbm(u * 48, v * 48, 48, 2) * 255;
+  }
+  return mkTex(S, S, { data: d, wrap: gl.REPEAT, mip: true, aniso: true });
+}
+
+/** water detail normal map + height in alpha (tiles seamlessly) */
+function makeWaterNormalTex() {
+  const S = 128, h = new Float32Array(S * S), d = new Uint8Array(S * S * 4);
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const u = x / S, v = y / S;
+    // stretched, wind-aligned ripples + isotropic chop
+    h[y * S + x] = pfbm(u * 16, v * 10, 16, 4) * .7 + pfbm(u * 33 + 5, v * 33 + 9, 33, 3) * .3;
+  }
+  const S1 = S - 1;
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const l = h[y * S + ((x - 1) & S1)], r = h[y * S + ((x + 1) & S1)];
+    const dn = h[((y - 1) & S1) * S + x], up = h[((y + 1) & S1) * S + x];
+    let nx = (l - r) * 5, nz = (dn - up) * 5, ny = 1;
+    const il = 1 / Math.hypot(nx, ny, nz);
+    const i = (y * S + x) * 4;
+    d[i] = (nx * il * .5 + .5) * 255; d[i + 1] = (ny * il * .5 + .5) * 255;
+    d[i + 2] = (nz * il * .5 + .5) * 255; d[i + 3] = h[y * S + x] * 255;
+  }
+  return mkTex(S, S, { data: d, wrap: gl.REPEAT, mip: true, aniso: true });
+}
+
+/** particle sprite atlas (2x2): 0 glow  1 smoke  2 spray  3 shard */
+function makeSpriteAtlas() {
+  const S = 256, T = 128;
+  const c = document.createElement('canvas'); c.width = c.height = S;
+  const x = c.getContext('2d');
+  x.clearRect(0, 0, S, S);
+  // 0 - soft additive glow
+  let g = x.createRadialGradient(64, 64, 0, 64, 64, 62);
+  g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(.22, 'rgba(255,255,255,.66)');
+  g.addColorStop(.55, 'rgba(255,255,255,.16)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+  x.fillStyle = g; x.fillRect(0, 0, T, T);
+  // 1 - smoke puff: clumped blobs, soft edges
+  x.save(); x.beginPath(); x.rect(T, 0, T, T); x.clip();
+  for (let i = 0; i < 26; i++) {
+    const a = rndG() * TAU, rad = Math.pow(rndG(), .55) * 40;
+    const px = T + 64 + cos(a) * rad, py = 64 + sin(a) * rad, r = 16 + rndG() * 26;
+    g = x.createRadialGradient(px, py, 0, px, py, r);
+    const al = .13 + rndG() * .1;
+    g.addColorStop(0, 'rgba(255,255,255,' + al + ')'); g.addColorStop(1, 'rgba(255,255,255,0)');
+    x.fillStyle = g; x.beginPath(); x.arc(px, py, r, 0, TAU); x.fill();
+  }
+  x.restore();
+  // 2 - spray droplets
+  x.save(); x.beginPath(); x.rect(0, T, T, T); x.clip();
+  for (let i = 0; i < 40; i++) {
+    const px = 12 + rndG() * 104, py = T + 12 + rndG() * 104, r = 2 + rndG() * 8;
+    g = x.createRadialGradient(px, py, 0, px, py, r);
+    g.addColorStop(0, 'rgba(255,255,255,.95)'); g.addColorStop(.6, 'rgba(255,255,255,.35)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+    x.fillStyle = g; x.beginPath(); x.arc(px, py, r, 0, TAU); x.fill();
+  }
+  x.restore();
+  // 3 - hard shard / debris silhouette
+  x.save(); x.translate(T + 64, T + 64);
+  x.fillStyle = '#fff'; x.beginPath();
+  for (let i = 0; i <= 7; i++) {
+    const a = i / 7 * TAU, rad = 26 + rndG() * 22;
+    const px = cos(a) * rad, py = sin(a) * rad * .8;
+    i ? x.lineTo(px, py) : x.moveTo(px, py);
+  }
+  x.closePath(); x.fill(); x.restore();
+  const img = x.getImageData(0, 0, S, S);
+  return mkTex(S, S, { data: new Uint8Array(img.data.buffer), mip: true });
+}
+
+const TEX = {};

@@ -1,0 +1,376 @@
+
+/* ============================ 17 main ============================== */
+/* Input, state machine, boot sequence and the frame loop.              */
+
+const Input = {
+  keys: Object.create(null), mouseDown: false, dx: 0, dy: 0, locked: false, sens: 1,
+  init() {
+    addEventListener('keydown', e => {
+      if (e.repeat) { e.preventDefault(); return; }
+      this.keys[e.code] = 1;
+      if (e.code === 'Escape') Game.togglePause();
+      if (e.code === 'KeyQ' && Game.state === 'pause') { Q.auto = false; Q.apply((Q.level + 1) % 4); }
+      if (e.code === 'KeyV') { Game.thirdPerson = !Game.thirdPerson; }
+      if (e.code === 'KeyP') { const p = $('perf'); p.style.display = p.style.display === 'block' ? 'none' : 'block'; }
+      if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'Space', 'ShiftLeft', 'KeyR', 'Tab'].indexOf(e.code) >= 0) e.preventDefault();
+      if (Game.state === 'intro' && (e.code === 'Space' || e.code === 'Enter')) Game.skipIntro();
+    });
+    addEventListener('keyup', e => { this.keys[e.code] = 0; });
+    addEventListener('mousedown', e => { if (e.button === 0) this.mouseDown = true; });
+    addEventListener('mouseup', e => { if (e.button === 0) this.mouseDown = false; });
+    addEventListener('mousemove', e => {
+      if (!this.locked) return;
+      this.dx += e.movementX || 0; this.dy += e.movementY || 0;
+    });
+    document.addEventListener('pointerlockchange', () => {
+      this.locked = document.pointerLockElement === canvas;
+      document.body.classList.toggle('playing', this.locked);
+      if (!this.locked && Game.state === 'play') Game.pause();
+    });
+    addEventListener('blur', () => { this.keys = Object.create(null); this.mouseDown = false; });
+    addEventListener('resize', () => R.resize(true));
+  },
+  k(code) { return !!this.keys[code]; },
+  consumeMouse() { const r = [this.dx * this.sens, this.dy * this.sens]; this.dx = 0; this.dy = 0; return r; },
+  lock() { if (canvas.requestPointerLock) canvas.requestPointerLock(); },
+  unlock() { if (document.exitPointerLock) document.exitPointerLock(); },
+};
+
+/** synthetic input: drives the craft through the cinematic, the menu
+    backdrop and the coast-in at extraction */
+const AutoPilot = {
+  mouseDown: false, steer: 0, coast: false,
+  k(code) {
+    if (code === 'KeyW') return !this.coast;
+    if (code === 'KeyS') return this.coast && Player.speed > 6;
+    if (code === 'KeyA') return this.steer > .12;
+    if (code === 'KeyD') return this.steer < -.12;
+    return false;
+  },
+  consumeMouse() { return [0, 0]; },
+  update() {
+    const ahead = Track.toWorld(Player.s + 60, 0);
+    const want = atan2(ahead[0] - Player.x, ahead[2] - Player.z);
+    this.steer = clamp(angDiff(want, Player.yaw) * 2.4, -1, 1);
+  },
+};
+
+const Game = {
+  state: 'boot', time: 0, elapsed: 0, kills: 0, invuln: 0, aiScale: 1,
+  avalanches: [], exfil: false, won: false, boat: null, thirdPerson: false,
+  exposureMul: 1, motionMul: 1, timeScale: 1, deadT: 0, winT: 0, topSpeed: 0,
+
+  /** true while the camera is on the rider (first person) */
+  fpv() {
+    return !this.thirdPerson && (this.state === 'play' || this.state === 'pause' || this.state === 'dead');
+  },
+  boot() {
+    const steps = [
+      ['GENERATING NOISE FIELDS', () => { TEX.noise = makeNoiseTex(); }],
+      ['SYNTHESISING WATER NORMALS', () => { TEX.waterN = makeWaterNormalTex(); }],
+      ['BAKING PARTICLE ATLAS', () => { TEX.sprite = makeSpriteAtlas(); }],
+      ['COMPILING SHADERS', () => { R.init(); }],
+      ['CARVING THE FJORD', () => { Track.build(); }],
+      ['LOFTING HULLS', () => { buildMeshes(); }],
+      ['FLOODING THE CHANNEL', () => { Water.build(); Foam.init(); }],
+      ['SEEDING PARTICLES', () => { Parts.init(); Snow.init(); }],
+      ['BRIEFING', () => { HUD.init(); Director.init(); Input.init(); }],
+      ['STREAMING TERRAIN', () => { Player.reset(0); Terrain.update(0, 6); }],
+    ];
+    let i = 0;
+    const tick = () => {
+      if (i >= steps.length) {
+        $('loadbar').style.width = '100%';
+        $('loadst').textContent = 'READY';
+        setTimeout(() => {
+          $('screen-load').classList.add('off');
+          $('screen-menu').classList.remove('off');
+          this.state = 'menu';
+          this.loop(performance.now());
+        }, 180);
+        return;
+      }
+      const [label, fn] = steps[i];
+      $('loadst').textContent = label;
+      $('loadbar').style.width = ((i + 1) / steps.length * 100).toFixed(0) + '%';
+      setTimeout(() => {
+        try { fn(); } catch (e) { fatal('BOOT FAILURE @ ' + label + '<br>' + (e && e.message ? e.message : e)); throw e; }
+        i++; tick();
+      }, 16);
+    };
+    tick();
+  },
+
+  start() {
+    if (!AU.ok) AU.init();
+    AU.resume(); AU.fadeIn(0.85, .8);
+    $('screen-menu').classList.add('off');
+    $('screen-end').classList.add('off');
+    this.reset();
+    this.state = 'intro';
+    Cine.reset();
+    HUD.show(true); HUD.letterbox(true); HUD.cine(true);
+    HUD.fade(0, 900);
+    Input.lock();
+  },
+  reset() {
+    Enemies.clear(); Hazards.init(); Parts.clear(); Terrain.clear();
+    this.avalanches.length = 0;
+    this.kills = 0; this.elapsed = 0; this.invuln = 0; this.exfil = false;
+    this.won = false; this.boat = null; this.deadT = 0; this.winT = 0;
+    this.timeScale = 1; this.exposureMul = 1; this.motionMul = 1; this.thirdPerson = true; this._idle = 0;
+    Gun.reset(); Gun.shots = 0; Gun.hits = 0; this.topSpeed = 0;
+    Player.reset(0);
+    Director.reset();
+    HUD.reset(); HUD.ammo(Gun.mag, Gun.reserve);
+    Terrain.update(0, 12);
+    Hazards.genS = -1;
+  },
+  restart() { this.reset(); this.state = 'play'; HUD.show(true); HUD.letterbox(false); HUD.cine(false); HUD.fade(0, 400); Input.lock(); },
+  skipIntro() {
+    if (this.state !== 'intro') return;
+    Cine.done = true;
+  },
+  beginPlay() {
+    this.state = 'play';
+    HUD.letterbox(false); HUD.cine(false);
+    HUD.banner('GO', 'FULL THROTTLE', 2.0);
+    Director.setObjective('RUN THE CHANNEL - DO NOT STOP', '');
+    Director.saveCheckpoint('LAUNCH');
+  },
+  togglePause() {
+    if (this.state === 'play') this.pause();
+    else if (this.state === 'pause') this.resume();
+  },
+  pause() {
+    if (this.state !== 'play') return;
+    this.state = 'pause';
+    $('screen-pause').classList.remove('off');
+    Input.unlock();
+    AU.suspend();
+    const m = $('pausemeta');
+    m.innerHTML = '<span>ELAPSED</span><b>' + fmtTime(this.elapsed) + '</b>' +
+      '<span>DISTANCE</span><b>' + (Player.s / 1000).toFixed(2) + ' KM</b>' +
+      '<span>HOSTILES DOWN</span><b>' + this.kills + '</b>' +
+      '<span>CHECKPOINT</span><b>' + (Director.checkpoint ? Director.checkpoint.name : '-') + '</b>';
+  },
+  resume() {
+    if (this.state !== 'pause') return;
+    $('screen-pause').classList.add('off');
+    this.state = 'play';
+    AU.resume();
+    Input.lock();
+  },
+  fail() {
+    if (this.state !== 'play') return;
+    this.state = 'dead';
+    this.deadT = 0;
+    AU.ui(4);
+    HUD.banner('HULL LOST', 'REGROUPING', 2.6);
+    FX.explosion(Player.x, Player.y + .4, Player.z, 2.4, true, this.time);
+    AU.explosion([Player.x, Player.y, Player.z], 2);
+  },
+  finish() {
+    if (this.won) return;
+    this.won = true;
+    this.state = 'win';
+    this.winT = 0;
+    this.thirdPerson = true;
+    HUD.letterbox(true);
+    HUD.banner('EXFIL', 'HANDSHAKE COMPLETE', 3.2);
+    HUD.sub('SPARROW ACTUAL', 'We have you. Cut the engine - you are aboard. Good run, two-one.', 5);
+    AU.bark(8, 0, null);
+  },
+  showEnd(success) {
+    const el = $('screen-end');
+    el.classList.toggle('fail', !success);
+    $('endkick').textContent = success ? 'EXFIL COMPLETE' : 'MISSION FAILED';
+    $('endtitle').textContent = success ? 'MISSION SUCCESS' : 'SPARROW 2-1 IS DOWN';
+    $('endsub').textContent = success ? 'THE DRIVE IS OFF THE ICE' : 'THE CHANNEL TOOK YOU';
+    const acc = Gun.shots ? (Gun.hits / Gun.shots * 100) : 0;
+    $('endstats').innerHTML =
+      '<span>TIME<b>' + fmtTime(this.elapsed) + '</b></span>' +
+      '<span>DISTANCE<b>' + (Player.s / 1000).toFixed(2) + ' KM</b></span>' +
+      '<span>HOSTILES DOWN<b>' + this.kills + '</b></span>' +
+      '<span>ACCURACY<b>' + acc.toFixed(1) + '%</b></span>' +
+      '<span>ROUNDS FIRED<b>' + Gun.shots + '</b></span>' +
+      '<span>HULL REMAINING<b>' + (Player.hull | 0) + '%</b></span>' +
+      '<span>CHECKPOINTS<b>' + Director.next + '</b></span>' +
+      '<span>TOP SPEED<b>' + (this.topSpeed * 3.6 | 0) + ' KM/H</b></span>';
+    el.classList.remove('off');
+    Input.unlock();
+    HUD.show(false);
+  },
+
+  /* ---------------- frame ---------------- */
+  loop(now) {
+    requestAnimationFrame(t => this.loop(t));
+    const raw = min((now - (this.last || now)) / 1000, .06);
+    this.last = now;
+    const ft = raw * 1000;
+    if (this.state === 'boot') return;
+
+    const dt = raw * this.timeScale;
+    this.time += raw;
+
+    if (this.state === 'menu') { this.renderIdle(raw); return; }
+
+    /* ---- simulation ---- */
+    if (this.state !== 'pause') {
+      if (this.state === 'play' || this.state === 'intro' || this.state === 'win') {
+        this.elapsed += dt;
+        if (this.invuln > 0) this.invuln -= dt;
+        this.topSpeed = max(this.topSpeed, Player.speed);
+
+        const active = this.state === 'play';
+        if (active) Player.update(dt, this.time, Input, true);
+        else {
+          AutoPilot.coast = this.state === 'win' && this.winT > 1.2;
+          AutoPilot.update();
+          Player.update(dt, this.time, AutoPilot, true);
+        }
+
+        Gun.update(dt, Input, this.time, active);
+        // the cinematic runs on clean water: no obstacles, no pursuit
+        if (this.state !== 'intro') { Enemies.update(dt, this.time); Hazards.update(dt, this.time); }
+        if (active) Director.update(dt);
+        Parts.update(dt, this.time);
+        Terrain.update(Player.s, 2);
+
+        if (Player.dead && this.state === 'play') this.fail();
+        if (this.exfil && !this.boat) this.spawnBoat();
+        if (this.boat) this.updateBoat(dt);
+      }
+      if (this.state === 'dead') {
+        this.deadT += raw;
+        this.timeScale = lerp(1, .25, smoothstep(0, .6, this.deadT));
+        Parts.update(raw * this.timeScale, this.time);
+        Enemies.update(raw * this.timeScale * .4, this.time);
+        this.exposureMul = lerp(1, .35, smoothstep(.2, 1.6, this.deadT));
+        if (this.deadT > .9 && this.deadT < 1.0) HUD.fade(1, 700);
+        if (this.deadT > 2.1) {
+          Director.restore();
+          this.timeScale = 1; this.exposureMul = 1;
+          this.state = 'play';
+          HUD.fade(0, 700);
+          HUD.banner('BACK IN THE FIGHT', Director.checkpoint ? Director.checkpoint.name : '', 2);
+          Input.lock();
+        }
+      }
+      if (this.state === 'win') {
+        this.winT += raw;
+        this.timeScale = lerp(1, .45, smoothstep(0, 2.4, this.winT));
+        this.exposureMul = lerp(1, 1.25, smoothstep(1.5, 4, this.winT));
+        if (this.winT > 3.2 && this.winT < 3.35) HUD.fade(1, 1400);
+        if (this.winT > 5.0) { this.state = 'over'; this.showEnd(true); HUD.fade(0, 600); }
+      }
+    }
+
+    /* ---- camera ---- */
+    if (this.state === 'intro') {
+      Cine.update(dt);
+      if (Cine.done) this.beginPlay();
+    } else if (this.thirdPerson) {
+      const back = 7.5;
+      Cam.eye = [
+        Player.eye[0] - Player.fwd[0] * back,
+        Player.eye[1] - Player.fwd[1] * back + 1.6,
+        Player.eye[2] - Player.fwd[2] * back
+      ];
+      Cam.fwd = [Player.fwd[0], Player.fwd[1], Player.fwd[2]];
+      Cam.right = [Player.right[0], Player.right[1], Player.right[2]];
+      Cam.up = [Player.up[0], Player.up[1], Player.up[2]];
+      Cam.fov = 62;
+    } else {
+      Cam.eye = Player.eye; Cam.fwd = Player.fwd; Cam.up = Player.up; Cam.right = Player.right;
+      Cam.fov = Player.fov;
+    }
+
+    /* ---- audio ---- */
+    if (AU.ok) {
+      if (!Player.engine) Player.engine = AU.engineNew(true);
+      AU.engineSet(Player.engine, Player.rpm, clamp(Player.speed / 40, 0, 1), 1, null, 0);
+      AU.setListener(Cam.eye, Cam.fwd, Cam.up);
+      const combat = clamp(Enemies.alive() * .22 + (Hazards.gunship ? .5 : 0) + (1 - Player.hull / 100) * .4, 0, 1);
+      AU.mix(raw, Player.speed, combat, Track.caveAt(Player.s) > .4);
+    }
+
+    /* ---- ambient particles ---- */
+    Snow.update(raw, Cam.eye, [3.2, 1.4], [Player.vx, Player.vz]);
+
+    /* ---- draw ---- */
+    R.frame(raw);
+    R.adapt(ft);
+    HUD.update(raw);
+    this.perf(ft);
+  },
+  /** menu backdrop: the craft runs the channel on autopilot, camera chases */
+  renderIdle(dt) {
+    if (!this._idle) { this._idle = 1; Player.reset(150); Hazards.init(); }
+    if (Player.s > 2600) Player.reset(150);
+    AutoPilot.coast = false;
+    AutoPilot.update();
+    Player.update(dt, this.time, AutoPilot, true);
+    const t = this.time * .25;
+    const back = 13 + sin(t * .5) * 4, side = 6 * sin(t * .33), up = 3.2 + sin(t * .21) * 1.6;
+    const fx = sin(Player.yaw), fz = cos(Player.yaw);
+    Cam.eye = [Player.x - fx * back + cos(Player.yaw) * side, Player.y + up, Player.z - fz * back - sin(Player.yaw) * side];
+    const look = [Player.x + fx * 10, Player.y + 1.4, Player.z + fz * 10];
+    Cam.fwd = V3.norm(V3.sub(look, Cam.eye));
+    Cam.right = V3.norm(V3.cross(Cam.fwd, [0, 1, 0]));
+    Cam.up = V3.norm(V3.cross(Cam.right, Cam.fwd));
+    Cam.fov = 54;
+    Terrain.update(Player.s, 2);
+    Parts.update(dt, this.time);
+    Snow.update(dt, Cam.eye, [3.2, 1.4], [Player.vx, Player.vz]);
+    R.frame(dt);
+  },
+  spawnBoat() {
+    const p = Track.toWorld(TRACK_LEN - 220, 0);
+    this.boat = { x: p[0], y: 0, z: p[2], yaw: Track.headAt(TRACK_LEN - 220) + .35, model: M4.create() };
+  },
+  /** the extraction boat rides the swell and closes the mission on contact */
+  updateBoat() {
+    const b = this.boat;
+    b.y = waterY(b.x, b.z, this.time) + .1;
+    M4.compose(b.model, [b.x, b.y, b.z],
+      b.yaw + sin(this.time * .4) * .03, sin(this.time * .8) * .04, sin(this.time * .55) * .06, 1, 1, 1);
+    if (this.state === 'play' && Math.hypot(b.x - Player.x, b.z - Player.z) < 26) this.finish();
+  },
+  perf(ft) {
+    const el = $('perf');
+    if (el.style.display !== 'block') return;
+    this._pa = (this._pa || 0) * .92 + ft * .08;
+    el.textContent =
+      (1000 / max(this._pa, .01)).toFixed(0) + ' FPS  ' + this._pa.toFixed(1) + ' ms\n' +
+      R.W + 'x' + R.H + ' @' + Q.scale.toFixed(2) + '  ' + Q.names[Q.level] + '\n' +
+      'parts ' + Parts.live.length + '  chunks ' + Terrain.chunks.size + '\n' +
+      'ai ' + Enemies.list.length + '  solids ' + Hazards.solids.length + '\n' +
+      's ' + (Player.s | 0) + 'm  ' + (Player.speed * 3.6 | 0) + 'km/h';
+  },
+};
+
+function fmtTime(s) {
+  const m = (s / 60) | 0, ss = (s % 60) | 0;
+  return m + ':' + (ss < 10 ? '0' : '') + ss;
+}
+
+/* ---- menu wiring ---- */
+$('btn-deploy').addEventListener('click', () => Game.start());
+$('btn-resume').addEventListener('click', () => Game.resume());
+$('btn-check').addEventListener('click', () => {
+  $('screen-pause').classList.add('off');
+  Game.state = 'play'; AU.resume();
+  Director.restore(); HUD.fade(0, 300); Input.lock();
+});
+$('btn-restart').addEventListener('click', () => { $('screen-pause').classList.add('off'); AU.resume(); Game.restart(); });
+$('btn-again').addEventListener('click', () => { $('screen-end').classList.add('off'); Game.start(); });
+canvas.addEventListener('click', () => {
+  if (Game.state === 'play' && !Input.locked) Input.lock();
+});
+
+/* ---- go ---- */
+Game.boot();
+</script>
+</body>
+</html>

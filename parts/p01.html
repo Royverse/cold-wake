@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no"/>
+<title>COLD WAKE // OPERATION WHITEWATER</title>
+<style>
+/* ===================================================================== *
+ *  COLD WAKE - HUD / SCREEN LAYER                                        *
+ *  All presentation is CSS + 2D canvas gauges; the world is WebGL2.      *
+ * ===================================================================== */
+:root{
+  --hud:#dff3ec; --dim:rgba(223,243,236,.55); --faint:rgba(223,243,236,.22);
+  --amber:#ffb454; --red:#ff5140; --ice:#8fd4ff; --ink:#04070a;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,"DejaVu Sans Mono",monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#04070a;color:var(--hud);
+  font-family:var(--mono);-webkit-font-smoothing:antialiased;user-select:none}
+body{cursor:default}
+body.playing{cursor:none}
+#view{position:fixed;inset:0;width:100%;height:100%;display:block;background:#04070a}
+.layer{position:fixed;inset:0;pointer-events:none}
+.off{display:none!important}
+.tx{text-shadow:0 0 8px rgba(0,0,0,.95),0 1px 2px rgba(0,0,0,.9)}
+
+/* ---------- full-screen colour FX ---------- */
+#fx{z-index:5}
+#vig{position:absolute;inset:0;background:radial-gradient(ellipse at 50% 52%,rgba(0,0,0,0) 42%,rgba(0,0,0,.55) 100%)}
+#dmg{position:absolute;inset:0;opacity:0;
+  background:radial-gradient(ellipse at 50% 50%,rgba(120,0,0,0) 30%,rgba(150,8,4,.85) 100%);
+  transition:opacity .18s linear;will-change:opacity;contain:strict}
+#dmg.hurt{transition:opacity .05s linear}
+#flash{position:absolute;inset:0;background:#fff;opacity:0}
+#fade{position:absolute;inset:0;background:#04070a;opacity:0;transition:opacity .6s linear}
+#lowhp{position:absolute;inset:0;opacity:0;box-shadow:inset 0 0 220px 40px rgba(140,10,6,.85);
+  will-change:opacity;contain:strict}
+#lowhp.on{animation:lowpulse 1.15s ease-in-out infinite}
+#lowhp.crit{animation:lowpulse .68s ease-in-out infinite}
+@keyframes lowpulse{0%,100%{opacity:.18}50%{opacity:.72}}
+#snowfx{position:absolute;inset:0;opacity:0;will-change:opacity;contain:strict;background:
+  repeating-linear-gradient(102deg,rgba(255,255,255,.05) 0 1px,transparent 1px 7px)}
+
+/* ---------- letterbox ---------- */
+#letter{z-index:8}
+#letter i{position:absolute;left:0;right:0;height:0;background:#04070a;display:block;
+  transition:height .8s cubic-bezier(.2,.8,.2,1)}
+#letter i.t{top:0}#letter i.b{bottom:0}
+#letter.on i{height:11.2vh}
+
+/* ---------- HUD ---------- */
+#hud{z-index:6;opacity:0;transition:opacity .45s ease}
+#hud.on{opacity:1}
+#hud .gauge{transition:opacity .5s ease}
+#hud.cine .gauge{opacity:0}
+#xh{position:absolute;left:50%;top:50%;width:44px;height:44px;margin:-22px 0 0 -22px}
+#xh i{position:absolute;background:var(--hud);box-shadow:0 0 4px rgba(0,0,0,.9);opacity:.9}
+#xh i.v{width:2px;height:9px;left:21px}
+#xh i.h{height:2px;width:9px;top:21px}
+#xh i.n{top:0}#xh i.s{bottom:0}#xh i.w{left:0}#xh i.e{right:0}
+#xh b{position:absolute;left:21px;top:21px;width:2px;height:2px;background:var(--hud);opacity:.75}
+#hm{position:absolute;left:50%;top:50%;width:34px;height:34px;margin:-17px 0 0 -17px;opacity:0}
+#hm i{position:absolute;width:11px;height:2px;background:#fff;box-shadow:0 0 6px rgba(0,0,0,.9)}
+#hm i:nth-child(1){transform:rotate(45deg);left:0;top:5px}
+#hm i:nth-child(2){transform:rotate(-45deg);right:0;top:5px}
+#hm i:nth-child(3){transform:rotate(-45deg);left:0;bottom:5px}
+#hm i:nth-child(4){transform:rotate(45deg);right:0;bottom:5px}
+#hm.kill i{background:var(--red)}

@@ -1,0 +1,364 @@
+
+/* ============================ 13 hazards =========================== */
+/* Floating obstacles, explosive drums, ice falls, collapsing spans,
+   avalanches and the gunship set piece. All of them are colliders that
+   the player and the AI must read out of the corridor.                 */
+
+const Hazards = {
+  solids: [], scenery: [], genS: -1, gunship: null,
+  init() { this.solids.length = 0; this.scenery.length = 0; this.genS = -1; this.gunship = null; },
+  add(o) {
+    const pr = Track.project(o.x, o.z, Track.idx(o.s || Player.s), { s: 0, lat: 0, i: 0 });
+    o.s = pr.s; o.lat = pr.lat; o.dead = false;
+    o.yaw = o.yaw === undefined ? rg(0, TAU) : o.yaw;
+    o.vy = o.vy || 0; o.spin = o.spin || 0; o.roll = o.roll || 0;
+    o.model = M4.create();
+    this.solids.push(o);
+    return o;
+  },
+  /** streamed obstacle scatter ahead of the player */
+  generate(s0, s1) {
+    for (let s = s0; s < s1; s += 24) {
+      const prog = s / TRACK_LEN;
+      const W = Track.widthAt(s);
+      const density = .17 + prog * .44;
+      if (rnd() < density) {
+        const lat = (rnd() < .5 ? -1 : 1) * W * rr(.22, .80);
+        const p = Track.toWorld(s, lat);
+        const roll = rnd();
+        if (roll < .46) {
+          const sc = rr(.75, 1.5);
+          this.add({
+            kind: 'ice', mesh: MESH.ice[(rnd() * 3) | 0], x: p[0], y: -.35, z: p[2], sc,
+            r: 1.7 * sc, hy: .6, hp: 40, mat: 1, float: 1, s,
+          });
+        } else if (roll < .72) {
+          this.add({
+            kind: 'pillar', mesh: MESH.pillar[(rnd() * 2) | 0], x: p[0], y: -1.2, z: p[2], sc: rr(.8, 1.4),
+            r: 2.6, hy: 3.5, hp: 1e9, mat: 1, s, hard: 1,
+          });
+        } else if (roll < .88) {
+          this.add({
+            kind: 'rock', mesh: MESH.rock[(rnd() * 2) | 0], x: p[0], y: -1.6, z: p[2], sc: rr(.7, 1.3),
+            r: 2.4, hy: 1.2, hp: 1e9, mat: 2, s, hard: 1,
+          });
+        } else {
+          this.add({
+            kind: 'drum', mesh: MESH.drum, x: p[0], y: 0, z: p[2], sc: 1,
+            r: .85, hy: .4, hp: 34, mat: 3, float: 1, s, boom: 1,
+          });
+        }
+      }
+      // shore dressing
+      if (rnd() < .5) {
+        const side = rnd() < .5 ? -1 : 1;
+        const u = rr(1.02, 1.24);
+        const i = Track.idx(s);
+        const lat = side * u * W;
+        const p = Track.toWorld(s, lat);
+        const y = shellY(u, W, side < 0 ? Track.wl[i] : Track.wr[i]);
+        const r2 = rnd();
+        this.scenery.push({
+          mesh: r2 < .5 ? MESH.ice[(rnd() * 3) | 0] : r2 < .7 ? MESH.crate : r2 < .85 ? MESH.buoy : MESH.rock[(rnd() * 2) | 0],
+          x: p[0], y: y - .3, z: p[2], yaw: rr(0, TAU), sc: rr(.7, 1.7), s,
+          model: M4.create(),
+        });
+      }
+    }
+  },
+  /** floating fuel drums strung across the channel */
+  drumField(s, n) {
+    for (let i = 0; i < n; i++) {
+      const ss = s + i * rg(17, 27);
+      const W = Track.widthAt(ss);
+      const p = Track.toWorld(ss, rg(-1, 1) * W * .62);
+      this.add({ kind: 'drum', mesh: MESH.drum, x: p[0], y: 0, z: p[2], sc: 1, r: .85, hy: .4, hp: 30, mat: 3, float: 1, s: ss, boom: 1 });
+    }
+  },
+  /** ice sheared off the cliff face, lands in the channel */
+  iceFall(s, n, spread) {
+    for (let i = 0; i < n; i++) {
+      const ss = s + rg(-spread, spread);
+      const W = Track.widthAt(ss);
+      const p = Track.toWorld(ss, rg(-1, 1) * W * .8);
+      const sc = rr(1.0, 2.1);
+      const o = this.add({
+        kind: 'ice', mesh: MESH.ice[(rnd() * 3) | 0], x: p[0], y: rg(34, 60), z: p[2], sc,
+        r: 1.9 * sc, hy: .8, hp: 60, mat: 1, float: 0, falling: 1, s: ss,
+        spin: rg(-2, 2), vy: -rg(1, 5), life: 30,
+      });
+      o.roll = rg(0, TAU);
+    }
+    AU.iceCrack([Player.x, Player.y + 20, Player.z], true);
+  },
+  /** a span that drops into the water as the player approaches */
+  bridge(s) {
+    const W = Track.widthAt(s);
+    const i = Track.idx(s);
+    const h = 13 + min(Track.wl[i], Track.wr[i]) * .18;
+    const parts = [];
+    const n = max(4, (W * 2 / 6) | 0);
+    for (let k = 0; k < n; k++) {
+      const lat = -W + (k + .5) * (W * 2 / n);
+      const p = Track.toWorld(s, lat);
+      parts.push(this.add({
+        kind: 'slab', mesh: MESH.slab, x: p[0], y: h, z: p[2], sc: 1,
+        r: 3.2, hy: .8, hp: 1e9, mat: 1, s, static: 1, yaw: Track.headAt(s) + PI / 2,
+        delay: .25 + k * rg(.08, .22), armed: 0,
+      }));
+    }
+    // support pylons at the banks
+    for (const side of [-1, 1]) {
+      const p = Track.toWorld(s, side * W * .98);
+      this.scenery.push({
+        mesh: MESH.slab, x: p[0], y: h * .5 - 3, z: p[2], yaw: Track.headAt(s) + PI / 2, sc: 1.1, s,
+        model: M4.create(), stretchY: h * .6,
+      });
+    }
+    return { s, parts, triggered: false, h };
+  },
+  update(dt, t) {
+    /* stream obstacles ahead */
+    if (this.genS < 0) this.genS = max(0, Player.s - 100);
+    if (this.genS < Player.s + 1000) { this.generate(this.genS, this.genS + 220); this.genS += 220; }
+
+    for (let i = this.solids.length - 1; i >= 0; i--) {
+      const o = this.solids[i];
+      if (o.dead || o.s < Player.s - 260) {
+        if (o.s < Player.s - 260 || o.deadT > 3) { this.solids.splice(i, 1); continue; }
+      }
+      if (o.dead) { o.deadT = (o.deadT || 0) + dt; continue; }
+
+      if (o.falling) {
+        o.vy -= 17 * dt; o.y += o.vy * dt; o.roll += o.spin * dt;
+        const wy = waterY(o.x, o.z, t);
+        if (o.y <= wy) {
+          o.y = wy; o.falling = 0; o.float = 1; o.vy = 0;
+          FX.splash(o.x, o.z, 1.1 * o.sc, t);
+          AU.splashSfx([o.x, o.y, o.z], 1);
+          FX.debris(o.x, o.y, o.z, 6, o.sc);
+          Player.shake = max(Player.shake, clamp(1.6 - Math.hypot(o.x - Player.x, o.z - Player.z) / 40, 0, .55));
+        }
+      } else if (o.float) {
+        const wy = waterY(o.x, o.z, t);
+        o.y = damp(o.y, wy + (o.kind === 'drum' ? .55 : -.1 * o.sc), 6, dt);
+        o.roll = damp(o.roll, waterNormal(o.x, o.z, t)[0] * .5, 3, dt);
+        o.yaw += dt * .12;
+      }
+      if (o.life !== undefined) { o.life -= dt; if (o.life <= 0) { o.dead = true; o.deadT = 0; } }
+      if (o.fuse > 0) {
+        o.fuse -= dt;
+        if (rndG() < dt * 30) FX.sparks(o.x, o.y + .5, o.z, 0, 1, 0, 2, [1, .7, .3]);
+        if (o.fuse <= 0) o.hp = 0;
+      }
+
+      /* --- player collision --- */
+      const dx = Player.x - o.x, dz = Player.z - o.z;
+      const d = Math.hypot(dx, dz);
+      const rr2 = o.r + VEH.hullR;
+      if (d < rr2 && abs(Player.y - o.y) < 3.2) {
+        const nx = dx / max(d, .001), nz = dz / max(d, .001);
+        const vn = Player.vx * nx + Player.vz * nz;
+        Player.x = o.x + nx * rr2; Player.z = o.z + nz * rr2;
+        if (vn < 0) {
+          const impact = -vn;
+          // rammed drums get a short fuse so momentum carries you clear
+          if (o.boom && !o.fuse) { o.fuse = .38; }
+          if (o.hard || impact > 8) {
+            Player.vx -= nx * vn * (o.hard ? 1.7 : 1.2);
+            Player.vz -= nz * vn * (o.hard ? 1.7 : 1.2);
+            // a short grace window stops a debris cluster from chaining hits
+            const grace = Game.time - (Player.hitCd || -9) > .55;
+            if (grace) Player.hitCd = Game.time;
+            Player.damage(grace ? clamp(impact * (o.hard ? 1.35 : .75), 4, o.hard ? 30 : 20) : 2,
+              [o.x, o.y, o.z]);
+            Player.shake = max(Player.shake, clamp(impact / 20, .2, 1));
+            AU.iceCrack([o.x, o.y, o.z], false);
+            FX.debris(o.x, o.y + .6, o.z, 9, o.sc || 1);
+            FX.splash(o.x, o.z, .7, t);
+            if (!o.hard && !o.boom) { o.dead = true; o.deadT = 0; }
+          } else {
+            Player.vx -= nx * vn * .9; Player.vz -= nz * vn * .9;
+            Player.damage(impact * .7, [o.x, o.y, o.z]);
+            FX.splash(o.x, o.z, .35, t);
+          }
+        }
+      }
+      /* --- enemies bump obstacles too --- */
+      for (const e of Enemies.list) {
+        if (e.dead) continue;
+        const ex = e.x - o.x, ez = e.z - o.z, ed = Math.hypot(ex, ez);
+        if (ed < o.r + 1.3) {
+          const nx = ex / max(ed, .001), nz = ez / max(ed, .001);
+          e.x = o.x + nx * (o.r + 1.3); e.z = o.z + nz * (o.r + 1.3);
+          e.speed *= .90;
+          if (o.boom && rndG() < .25) o.hp = 0;
+          if (rndG() < .3) FX.splash(e.x, e.z, .4, t);
+        }
+      }
+      if (o.boom && o.hp <= 0) this.blow(o, t);
+      M4.compose(o.model, [o.x, o.y, o.z], o.yaw, o.pitch || 0, o.roll || 0, o.sc || 1, o.sc || 1, o.sc || 1);
+    }
+
+    /* keep scenery list bounded */
+    for (let i = this.scenery.length - 1; i >= 0; i--) {
+      const p = this.scenery[i];
+      if (p.s < Player.s - 300) { this.scenery.splice(i, 1); continue; }
+      M4.compose(p.model, [p.x, p.y, p.z], p.yaw, 0, 0, p.sc, p.stretchY || p.sc, p.sc);
+    }
+
+    if (this.gunship) this.updateGunship(dt, t);
+  },
+  blow(o, t) {
+    if (o.dead) return;
+    o.dead = true; o.deadT = 0;
+    FX.explosion(o.x, o.y + .4, o.z, 2.0, true, t);
+    AU.explosion([o.x, o.y, o.z], 1.6);
+    Foam.add(o.x, o.z, 9, 1, 1, 0, 1, .7);
+    // area damage + chain reaction
+    const dp = Math.hypot(Player.x - o.x, Player.z - o.z);
+    if (dp < 15) {
+      Player.damage((1 - dp / 15) * 33, [o.x, o.y, o.z]);
+      Player.shake = max(Player.shake, (1 - dp / 15) * 1.3);
+      const k = (1 - dp / 15) * 24;
+      const nx = (Player.x - o.x) / max(dp, .01), nz = (Player.z - o.z) / max(dp, .01);
+      Player.vx += nx * k; Player.vz += nz * k; Player.vy += k * .35;
+    }
+    for (const e of Enemies.list) {
+      if (e.dead) continue;
+      const d = Math.hypot(e.x - o.x, e.z - o.z);
+      if (d < 15) { e.damage(120 * (1 - d / 15), [o.x, o.y, o.z]); }
+    }
+    for (const q of this.solids) {
+      if (q !== o && q.boom && !q.dead) {
+        const d = Math.hypot(q.x - o.x, q.z - o.z);
+        if (d < 11) setTimeout(() => { if (!q.dead) this.blow(q, Game.time); }, 90 + rndG() * 220);
+      }
+    }
+  },
+  /* ---- gunship set piece ---- */
+  spawnGunship(dur) {
+    const g = {
+      x: 0, y: 42, z: 0, yaw: 0, s: Player.s + 260, lat: 0, hp: 620, dead: false, t: 0, dur,
+      rocketT: 2.2, strafeT: 5, rotor: 0, model: M4.create(), rotorM: M4.create(), rotorTM: M4.create(),
+      vx: 0, vz: 0, crash: 0,
+    };
+    const p = Track.toWorld(g.s, 0); g.x = p[0]; g.z = p[2];
+    this.gunship = g;
+    return g;
+  },
+  updateGunship(dt, t) {
+    const g = this.gunship;
+    g.t += dt; g.rotor += dt * 26;
+    if (g.crash) {
+      g.vy = (g.vy || 0) - 15 * dt;
+      g.y += g.vy * dt; g.x += g.vx * dt; g.z += g.vz * dt;
+      g.yaw += dt * 4.5; g.roll = (g.roll || 0) + dt * 1.6;
+      if (rndG() < dt * 25) FX.explosion(g.x + rg(-2, 2), g.y, g.z + rg(-2, 2), .5, false, t);
+      if (g.y < waterY(g.x, g.z, t) + 1) {
+        FX.explosion(g.x, g.y, g.z, 4.5, true, t);
+        AU.explosion([g.x, g.y, g.z], 2.4);
+        Player.shake = max(Player.shake, clamp(1.8 - Math.hypot(g.x - Player.x, g.z - Player.z) / 60, .2, 1.5));
+        HUD.banner('THREAT DOWN', 'GUNSHIP DESTROYED', 2.4);
+        this.gunship = null;
+        Game.kills += 4;
+        return;
+      }
+      M4.compose(g.model, [g.x, g.y, g.z], g.yaw, .3, g.roll, 1, 1, 1);
+      M4.compose(g.rotorM, [g.x, g.y + 1.7, g.z], g.rotor, 0, 0, 1, 1, 1);
+      M4.compose(g.rotorTM, [g.x, g.y + .9, g.z], g.yaw, 0, g.rotor * 2, 1, 1, 1);
+      return;
+    }
+    // hold station ahead of and above the player
+    const wantS = Player.s + lerp(170, 90, clamp(g.t / 20, 0, 1));
+    const p = Track.toWorld(wantS, sin(g.t * .5) * 14);
+    const tx = p[0], tz = p[2];
+    g.vx = damp(g.vx, (tx - g.x) * 1.1, 2, dt); g.vz = damp(g.vz, (tz - g.z) * 1.1, 2, dt);
+    g.x += g.vx * dt; g.z += g.vz * dt;
+    g.y = damp(g.y, 34 + sin(g.t * .7) * 5, 1.5, dt);
+    const wantYaw = atan2(Player.x - g.x, Player.z - g.z);
+    g.yaw = damp(g.yaw, g.yaw + angDiff(wantYaw, g.yaw), 2.5, dt);
+    g.roll = damp(g.roll || 0, clamp(-g.vx * .01, -.3, .3), 2, dt);
+    Track.project(g.x, g.z, Track.idx(g.s), g);
+
+    // rockets walk explosions toward the player
+    g.rocketT -= dt;
+    if (g.rocketT <= 0) {
+      g.rocketT = rg(2.4, 4.0);
+      const n = 3;
+      for (let i = 0; i < n; i++) {
+        const lead = 26 - i * 11;
+        const tp = Track.toWorld(Player.s + lead, Player.lat + rg(-7, 7));
+        setTimeout(() => {
+          if (Game.state !== 'play') return;
+          FX.explosion(tp[0], .4, tp[2], 2.4, true, Game.time);
+          AU.explosion(tp, 2);
+          const d = Math.hypot(tp[0] - Player.x, tp[2] - Player.z);
+          if (d < 15) {
+            Player.damage((1 - d / 15) * 34, tp);
+            Player.shake = max(Player.shake, (1 - d / 15) * 1.4);
+          }
+        }, i * 260);
+      }
+      HUD.warn('INCOMING', 1.6);
+      AU.ui(2);
+    }
+    // door gun strafe
+    g.strafeT -= dt;
+    if (g.strafeT <= 0) {
+      g.strafeT = rg(3.2, 5.4);
+      let k = 0;
+      const iv = setInterval(() => {
+        if (Game.state !== 'play' || !this.gunship) { clearInterval(iv); return; }
+        k++;
+        const mx = g.x, my = g.y - 1, mz = g.z;
+        const tp = [Player.x + rg(-9, 9), Player.y + rg(0, 2), Player.z + rg(-9, 9)];
+        const d = V3.norm([tp[0] - mx, tp[1] - my, tp[2] - mz]);
+        FX.muzzle(mx, my, mz, d[0], d[1], d[2], 1.3);
+        FX.tracer(mx, my, mz, d[0], d[1], d[2], 200, [1, .6, .3], 700);
+        AU.shot([mx, my, mz], 1, .55);
+        const hd = Math.hypot(tp[0] - Player.x, tp[2] - Player.z);
+        if (hd < 3.2 && rndG() < .35) Player.damage(rg(3, 6), [g.x, g.y, g.z]);
+        else if (hd < 12) { HUD.suppress(); FX.splash(tp[0], tp[2], .3, Game.time); }
+        if (k > 12) clearInterval(iv);
+      }, 70);
+    }
+    if (g.t > g.dur) {
+      // breaks off
+      g.y = damp(g.y, 120, .6, dt);
+      if (g.y > 90) { this.gunship = null; return; }
+    }
+    M4.compose(g.model, [g.x, g.y, g.z], g.yaw, 0, g.roll, 1, 1, 1);
+    M4.compose(g.rotorM, [g.x, g.y + 1.7, g.z], g.rotor, 0, 0, 1, 1, 1);
+    M4.compose(g.rotorTM, [g.x + sin(g.yaw + PI / 2) * .3, g.y + .9, g.z + cos(g.yaw + PI / 2) * .3], g.yaw, 0, g.rotor * 2, 1, 1, 1);
+  },
+  hitGunship(dmg, p) {
+    const g = this.gunship;
+    if (!g || g.crash) return false;
+    g.hp -= dmg;
+    FX.sparks(p[0], p[1], p[2], 0, 1, 0, 6, [1, .8, .4]);
+    if (g.hp <= 0) {
+      g.crash = 1; g.vy = 2;
+      AU.explosion([g.x, g.y, g.z], 1.6);
+      FX.explosion(g.x, g.y, g.z, 2.2, false, Game.time);
+      return true;
+    }
+    return false;
+  },
+  /** avalanche: a wall of snow crossing the corridor */
+  avalanche(s, side) {
+    const W = Track.widthAt(s);
+    const a = { s, side, t: 0, dur: 6.5, W };
+    Game.avalanches.push(a);
+    AU.iceCrack([Player.x + side * 30, 30, Player.z], true);
+    for (let i = 0; i < 9; i++) {
+      const ss = s + rg(-40, 40);
+      const p = Track.toWorld(ss, side * Track.widthAt(ss) * rg(.5, .95));
+      this.add({
+        kind: 'ice', mesh: MESH.ice[(rnd() * 3) | 0], x: p[0], y: rg(20, 40), z: p[2], sc: rr(1.2, 2.4),
+        r: 2.4, hy: 1, hp: 80, mat: 1, falling: 1, s: ss, vy: -6, spin: rg(-3, 3), life: 26,
+      });
+    }
+    return a;
+  },
+};

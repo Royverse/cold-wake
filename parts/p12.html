@@ -1,0 +1,317 @@
+
+/* ============================ 12 enemy AI ========================== */
+/* Pursuit craft. Each one runs: corridor-space steering with prediction,
+   obstacle + peer avoidance, a flank slot, rubber-banded speed to hold
+   the chase at cinematic distance, and burst fire with suppression.    */
+
+const BARK = {
+  contact: ['Contact! They are on the channel!', 'Runner in the narrows - close it up!', 'I have eyes, closing in!'],
+  flank: ['Cut wide - take the inside line!', 'Push left, box them in!', 'Splitting off, going around!'],
+  fire: ['Light them up!', 'On target, firing!', 'Put rounds on that hull!'],
+  reload: ['Reloading - keep them honest!', 'Dry! Cover me!'],
+  hit: ['Hull is punched, still running!', 'I am hit! Still on them!'],
+  lost: ['They are pulling away!', 'Losing the line - more power!'],
+  dead: ['Man down!', 'We lost one!', 'He is off the water!'],
+};
+
+class Enemy {
+  constructor(s, lat, aggro, tier) {
+    const p = Track.toWorld(s, lat);
+    this.x = p[0]; this.y = .35; this.z = p[2];
+    this.yaw = Track.headAt(s);
+    this.vx = sin(this.yaw) * 26; this.vz = cos(this.yaw) * 26; this.vy = 0;
+    this.speed = 26; this.roll = 0; this.pitch = 0;
+    this.hp = 100 + tier * 45; this.maxHp = this.hp;
+    this.dead = false; this.deadT = 0; this.sink = 0;
+    this.aggro = aggro; this.tier = tier || 0;
+    this.idx = Track.idx(s); this.s = s; this.lat = lat;
+    this.proj = { s: 0, lat: 0, i: this.idx };
+    this.slot = lat > 0 ? 1 : -1;
+    this.slotT = rg(0, 4);
+    this.targetLat = lat;
+    this.fireT = rg(.8, 2.4); this.burst = 0; this.burstT = 0; this.overtake = 0;
+    this.acc = .13 + aggro * .16 + tier * .04;
+    this.state = 'chase';
+    this.trail = []; this.trailT = 0;
+    this.eng = AU.engineNew(false);
+    this.hurtFlash = 0;
+    this.model = M4.create();
+    this.wreckSpin = 0;
+  }
+  damage(amt, at) {
+    if (this.dead) return false;
+    this.hp -= amt;
+    this.hurtFlash = 1;
+    if (this.hp <= 0) { this.kill(); return true; }
+    if (rndG() < .12) Enemies.say('hit', this);
+    return false;
+  }
+  kill() {
+    this.dead = true; this.deadT = 0;
+    FX.explosion(this.x, this.y + .6, this.z, 1.5, true, Game.time);
+    AU.explosion([this.x, this.y, this.z], 1.2);
+    AU.engineStop(this.eng); this.eng = null;
+    FX.debris(this.x, this.y + .5, this.z, 10, 1.0, [.2, .2, .22]);
+    Enemies.say('dead', this);
+    Game.kills++;
+    Director.onKill();
+  }
+  update(dt, t) {
+    if (this.dead) {
+      this.deadT += dt;
+      // burning wreck drifts and settles
+      this.vx *= Math.exp(-1.2 * dt); this.vz *= Math.exp(-1.2 * dt);
+      this.x += this.vx * dt; this.z += this.vz * dt;
+      const wy = waterY(this.x, this.z, t);
+      this.sink = min(1, this.sink + dt * .12);
+      this.y = lerp(wy + .3, wy - 2.2, this.sink);
+      this.wreckSpin += dt * .5;
+      this.roll = damp(this.roll, .7, 1.2, dt);
+      if (rndG() < dt * 9 && this.sink < .6) {
+        Parts.add({
+          x: this.x + (rndG() - .5) * 1.6, y: this.y + .6, z: this.z + (rndG() - .5) * 1.6,
+          vx: (rndG() - .5) * 1.4, vy: 1.6 + rndG() * 2.4, vz: (rndG() - .5) * 1.4,
+          life: 1.8 + rndG() * 2, s0: .8, s1: 4.2, c0: [.16, .16, .17], c1: [.07, .07, .08],
+          a0: .7, a1: 0, drag: .7, g: 1.6, tile: TILE.SMOKE,
+        });
+        if (rndG() < .4) Parts.add({
+          x: this.x + (rndG() - .5) * 1.2, y: this.y + .4, z: this.z + (rndG() - .5) * 1.2,
+          vx: 0, vy: 1.4 + rndG() * 2, vz: 0, life: .35, s0: .7, s1: .2,
+          c0: [1, .7, .28], c1: [.8, .2, .05], a0: .9, a1: 0, drag: 1.4, g: 2, tile: TILE.GLOW, add: 1,
+        });
+      }
+      M4.compose(this.model, [this.x, this.y, this.z], this.yaw + this.wreckSpin * .3, this.pitch, this.roll, 1, 1, 1);
+      return;
+    }
+
+    Track.project(this.x, this.z, this.idx, this.proj);
+    this.idx = this.proj.i; this.s = this.proj.s; this.lat = this.proj.lat;
+    const W = Track.widthAt(this.s);
+    const pS = Player.s, dS = pS - this.s;              // + = player ahead
+    const dist = Math.hypot(Player.x - this.x, Player.z - this.z);
+
+    /* ---- flank slot: drift between lanes so they do not stack up ---- */
+    this.slotT -= dt;
+    if (this.overtake > 0) this.overtake -= dt;
+    if (this.slotT <= 0) {
+      this.slotT = rg(2.6, 6.5);
+      if (rndG() < .45 + this.aggro * .3) { this.slot = -this.slot; this.state = 'flank'; Enemies.say('flank', this); }
+      else this.state = 'chase';
+      // committed riders occasionally surge past to block the line
+      if (this.overtake > 0) this.overtake = 0;
+      else if (rndG() < .22 * this.aggro) { this.overtake = rg(3.5, 6); this.state = 'block'; }
+    }
+    const lane = this.slot * lerp(.28, .62, this.aggro) * W;
+    let wantLat = clamp(Player.lat * .55 + lane, -W * .82, W * .82);
+
+    /* ---- avoid solids and each other ---- */
+    for (const h of Hazards.solids) {
+      if (h.dead || abs(h.s - this.s) > 60) continue;
+      const d = Math.hypot(h.x - this.x, h.z - this.z);
+      if (d < 26) {
+        const rel = h.lat - this.lat;
+        wantLat -= sign(rel || 1) * (26 - d) * .9;
+      }
+    }
+    for (const o of Enemies.list) {
+      if (o === this || o.dead) continue;
+      const d = Math.hypot(o.x - this.x, o.z - this.z);
+      if (d < 9) wantLat += sign(this.lat - o.lat || 1) * (9 - d) * .55;
+    }
+    // riders hold a firing lane instead of climbing onto the player's hull
+    if (dist < 15) {
+      wantLat += sign(this.lat - Player.lat || this.slot) * (15 - dist) * 1.15;
+      if (abs(dS) < 8) this.speed *= 1 - dt * .9;
+    }
+    wantLat = clamp(wantLat, -W * .86, W * .86);
+    this.targetLat = damp(this.targetLat, wantLat, 2.4, dt);
+
+    /* ---- predictive aim point down the corridor ---- */
+    const lead = clamp(dist / 55, .25, 2.2);
+    const aimS = this.s + max(22, this.speed * .85) + max(0, dS) * .35 + lead * 6;
+    const aimP = Track.toWorld(aimS, this.targetLat);
+    let wantYaw = atan2(aimP[0] - this.x, aimP[2] - this.z);
+    // when close behind, aim at the player instead so they track the wake
+    if (dS > 0 && dS < 55) {
+      const py = atan2(Player.x + Player.vx * lead - this.x, Player.z + Player.vz * lead - this.z);
+      wantYaw = lerp(wantYaw, py, clamp(1 - dS / 55, 0, .55));
+    }
+    const dy = angDiff(wantYaw, this.yaw);
+    const maxRate = lerp(2.1, .95, clamp(this.speed / 50, 0, 1));
+    const rate = clamp(dy * 2.6, -maxRate, maxRate);
+    this.yaw += rate * dt;
+
+    /* ---- rubber banding: hold a cinematic gap ---- */
+    const want = this.overtake > 0 ? -24 : lerp(40, 19, this.aggro);
+    let target = Player.speed + clamp((dS - want) * .28, -9, 16);
+    if (dS > 130) target += 12;                      // fell behind, catch up
+    if (dS < -60) target -= 10;                      // overtook, ease off
+    target = clamp(target, 16, 64) * lerp(.94, 1.06, this.aggro);
+    if (Player.speed < 8) target = min(target, 22);  // do not lap a stopped player
+    this.speed = damp(this.speed, target, 1.5, dt);
+
+    const fx = sin(this.yaw), fz = cos(this.yaw);
+    this.vx = damp(this.vx, fx * this.speed, 5, dt);
+    this.vz = damp(this.vz, fz * this.speed, 5, dt);
+    this.x += this.vx * dt; this.z += this.vz * dt;
+
+    // ride the surface
+    const wy = waterY(this.x, this.z, t);
+    this.y = damp(this.y, wy + .34, 9, dt);
+    this.roll = damp(this.roll, clamp(-rate * .55, -.5, .5), 5, dt);
+    this.pitch = damp(this.pitch, clamp(-(target - this.speed) * .012, -.2, .2), 5, dt);
+
+    // corridor clamp
+    const lim = W * .93 - 1.4;
+    if (abs(this.lat) > lim) {
+      const sd = sign(this.lat), over = min(abs(this.lat) - lim, 10);
+      const nx = -sd * Track.dz[this.idx], nz = sd * Track.dx[this.idx];
+      this.x += nx * over; this.z += nz * over;
+      this.speed *= .985;
+      if (rndG() < dt * 6) FX.puff(this.x, this.y + .4, this.z, nx, .4, nz, 3, [.9, .95, 1], .8);
+    }
+
+    /* ---- collide with the player ---- */
+    if (dist < 3.0) {
+      const nx = (this.x - Player.x) / max(dist, .01), nz = (this.z - Player.z) / max(dist, .01);
+      this.x += nx * (3.0 - dist); this.z += nz * (3.0 - dist);
+      Player.x -= nx * (3.0 - dist) * .8; Player.z -= nz * (3.0 - dist) * .8;
+      if (Game.time - (this._ramT || 0) > 1.5) {
+        this._ramT = Game.time;
+        Player.damage(6, [this.x, this.y, this.z]);
+        this.hp -= 22;
+        FX.sparks(Player.x + nx, Player.y + .5, Player.z + nz, nx, .3, nz, 8);
+        AU.impactSfx([this.x, this.y, this.z], 3);
+        if (this.hp <= 0) this.kill();
+      }
+    }
+
+    /* ---- weapons ---- */
+    this.fireT -= dt;
+    const facing = abs(angDiff(atan2(Player.x - this.x, Player.z - this.z), this.yaw));
+    const canSee = dist < 135 && facing < .58 && dS > -40;
+    if (this.burst > 0) {
+      this.burstT -= dt;
+      if (this.burstT <= 0) {
+        this.burstT = .085;
+        this.burst--;
+        this.shoot(dist, canSee);
+      }
+    } else if (this.fireT <= 0 && canSee && Enemies.firing() < 3) {
+      this.burst = (3 + (rndG() * 5 * (.5 + this.aggro)) | 0);
+      this.burstT = 0;
+      this.fireT = lerp(3.0, 1.1, this.aggro) + rg(0, .9);
+      if (rndG() < .3) Enemies.say('fire', this);
+      this.state = 'attack';
+    }
+
+    /* ---- wake ---- */
+    this.trailT -= dt;
+    if (this.trailT <= 0) {
+      this.trailT = .06;
+      this.trail.push({ x: this.x, z: this.z, dx: fx, dz: fz, a: 0, w: clamp(this.speed / 34, .3, 1.2) });
+      if (this.trail.length > 46) this.trail.shift();
+    }
+    for (const p of this.trail) p.a += dt;
+    while (this.trail.length && this.trail[0].a > 2.6) this.trail.shift();
+    if (rndG() < dt * 9 && this.speed > 14) {
+      FX.spray(this.x - fx * 2.0, wy + .2, this.z - fz * 2.0,
+        -fx * this.speed * .22 + (rndG() - .5) * 2.5, 3 + this.speed * .12, -fz * this.speed * .22 + (rndG() - .5) * 2.5,
+        1, .8 + this.speed * .01, .7);
+    }
+
+    this.hurtFlash = max(0, this.hurtFlash - dt * 3);
+    if (this.eng) {
+      const rel = [(this.x - Player.x), (this.y - Player.y), (this.z - Player.z)];
+      const d2 = max(Math.hypot(rel[0], rel[1], rel[2]), .001);
+      const relV = [(this.vx - Player.vx), 0, (this.vz - Player.vz)];
+      const radial = (rel[0] * relV[0] + rel[2] * relV[2]) / d2;
+      AU.engineSet(this.eng, clamp(this.speed / 52, .15, 1.1), .4, clamp(1 - d2 / 220, 0, 1), [this.x, this.y + .5, this.z], radial);
+    }
+    M4.compose(this.model, [this.x, this.y, this.z], this.yaw, this.pitch, this.roll, 1, 1, 1);
+  }
+  shoot(dist, canSee) {
+    if (!canSee) return;
+    const fx = sin(this.yaw), fz = cos(this.yaw);
+    const mx = this.x + fx * .8 + cos(this.yaw) * .35, my = this.y + 1.15, mz = this.z + fz * .8 - sin(this.yaw) * .35;
+    const tgt = [Player.x, Player.y + 1.1, Player.z];
+    let d = V3.norm([tgt[0] - mx, tgt[1] - my, tgt[2] - mz]);
+    const hitChance = this.acc * clamp(1 - dist / 150, 0, 1) * (Player.speed > 40 ? .62 : 1) * Game.aiScale;
+    const hit = rndG() < hitChance;
+    if (!hit) {
+      const miss = .035 + rndG() * .05;
+      d = V3.norm([d[0] + (rndG() - .5) * miss * 2, d[1] + (rndG() - .5) * miss, d[2] + (rndG() - .5) * miss * 2]);
+    }
+    FX.muzzle(mx, my, mz, d[0], d[1], d[2], .8);
+    FX.tracer(mx, my, mz, d[0], d[1], d[2], dist + 20, [1, .55, .25], 560);
+    AU.shot([mx, my, mz], 1, .8);
+    if (hit) {
+      Player.damage(rg(3.2, 6.4) * Game.aiScale, [this.x, this.y, this.z]);
+      FX.sparks(Player.x, Player.y + .9, Player.z, -d[0], -d[1], -d[2], 5, [1, .8, .5]);
+    } else {
+      // near miss: crack past the ear and kick up water
+      const t = dist * (.85 + rndG() * .3);
+      const px = mx + d[0] * t, py = my + d[1] * t, pz = mz + d[2] * t;
+      if (Math.hypot(px - Player.x, pz - Player.z) < 9) {
+        AU.whiz([px, py, pz]);
+        HUD.suppress();
+      }
+      if (py < waterY(px, pz, Game.time) + .5) FX.splash(px, pz, .18, Game.time);
+    }
+  }
+}
+
+const Enemies = {
+  list: [], sayT: 0, CAP: 5,
+  spawn(opts) {
+    if (this.alive() >= this.CAP) return null;
+    const e = new Enemy(opts.s, opts.lat, opts.aggro === undefined ? .5 : opts.aggro, opts.tier || 0);
+    this.list.push(e);
+    return e;
+  },
+  /** how many are mid-burst - caps the incoming volume of fire */
+  firing() { let n = 0; for (const e of this.list) if (!e.dead && e.burst > 0) n++; return n; },
+  /** spawn a pursuit wave behind the player */
+  wave(n, aggro, tier) {
+    for (let i = 0; i < n; i++) {
+      const lat = (i % 2 ? 1 : -1) * rg(6, 15) * (1 + (i >> 1) * .25);
+      const back = 62 + i * 16 + rg(0, 20);
+      const W = Track.widthAt(Player.s - back);
+      this.spawn({ s: Player.s - back, lat: clamp(lat, -W * .7, W * .7), aggro, tier });
+    }
+    this.say('contact', this.list[this.list.length - 1]);
+    HUD.threat(this.alive());
+  },
+  alive() { let n = 0; for (const e of this.list) if (!e.dead) n++; return n; },
+  say(kind, e) {
+    if (Game.time - this.sayT < 2.2) return;
+    this.sayT = Game.time;
+    const lines = BARK[kind]; if (!lines) return;
+    const txt = lines[(rndG() * lines.length) | 0];
+    HUD.sub('HOSTILE RADIO', txt, 2.6, true);
+    AU.bark(3 + (rndG() * 3 | 0), 1, e ? [e.x, e.y + 1, e.z] : null);
+  },
+  update(dt, t) {
+    for (let i = this.list.length - 1; i >= 0; i--) {
+      const e = this.list[i];
+      e.update(dt, t);
+      if ((e.dead && e.deadT > 16) || e.s < Player.s - 420 || e.s > Player.s + 420) {
+        if (e.eng) AU.engineStop(e.eng);
+        this.list.splice(i, 1);
+      }
+    }
+  },
+  emitWake() {
+    for (const e of this.list) {
+      if (e.dead) continue;
+      for (const p of e.trail) {
+        const k = 1 - p.a / 2.6;
+        Foam.add(p.x, p.z, 1.2 + p.a * 2.8 * p.w, .30 * k * k * p.w, p.dx, p.dz, 1.5, .3);
+      }
+    }
+  },
+  clear() {
+    for (const e of this.list) if (e.eng) AU.engineStop(e.eng);
+    this.list.length = 0;
+  },
+};

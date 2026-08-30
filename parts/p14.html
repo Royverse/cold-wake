@@ -1,0 +1,291 @@
+
+/* ============================ 14 director ========================== */
+/* Mission pacing. Beats fire on distance so the rhythm holds no matter
+   how fast the player drives; a pressure system keeps the chase alive
+   between set pieces, and checkpoints snapshot the whole run state.    */
+
+const Director = {
+  beats: [], next: 0, pressure: 0, pressureT: 0, tier: 0,
+  bridges: [], checkpoint: null, objText: '', objMeta: '',
+
+  init() {
+    const B = (s, name, obj, cp, fn) => this.beats.push({ s, name, obj, cp, fn, done: false });
+
+    B(240, 'launch', 'RUN THE CHANNEL - DO NOT STOP', true, () => {
+      HUD.banner('CONTACT', 'PURSUIT ON YOUR SIX', 2.6);
+      HUD.sub('SPARROW 2-2', 'Two skis off the ice shelf, they are on you. Move!', 3.4);
+      Enemies.wave(2, .38, 0);
+      this.pressure = 2; this.tier = 0;
+    });
+
+    B(1500, 'icefall', 'PUSH THROUGH THE ICE FALL', false, () => {
+      HUD.warn('ICE FALL', 2.2);
+      HUD.sub('SPARROW 2-2', 'Shelf is coming apart above you - keep your line!', 3.2);
+      Hazards.iceFall(Player.s + 210, 9, 90);
+      setTimeout(() => { if (Game.state === 'play') Hazards.iceFall(Player.s + 190, 7, 70); }, 3800);
+      this.pressure = 2;
+    });
+
+    B(2900, 'wave2', 'LOSE THE PURSUIT', true, () => {
+      HUD.banner('MORE CONTACTS', 'THREE INBOUND', 2.4);
+      Enemies.wave(3, .55, 0);
+      this.pressure = 3;
+    });
+
+    B(4400, 'drums', 'BREACH THE FUEL LINE - SHOOT THE DRUMS', false, () => {
+      HUD.sub('SPARROW 2-2', 'They floated fuel drums across the neck. Blow a hole in it.', 3.6);
+      Hazards.drumField(Player.s + 200, 6);
+      Hazards.drumField(Player.s + 420, 5);
+      this.pressure = 3;
+    });
+
+    B(5900, 'bridge', 'GET UNDER THE SPAN', true, () => {
+      HUD.warn('SPAN COLLAPSING', 2.6);
+      HUD.sub('SPARROW 2-2', 'They rigged the crossing. It is coming down - punch it!', 3.4);
+      this.bridges.push(Hazards.bridge(Player.s + 300));
+      this.pressure = 3;
+    });
+
+    B(7300, 'ambush', 'BREAK THE BLOCKADE', false, () => {
+      HUD.banner('AMBUSH', 'BLOCKING FORCE AHEAD', 2.4);
+      for (let i = 0; i < 2; i++) {
+        const W = Track.widthAt(Player.s + 150);
+        Enemies.spawn({ s: Player.s + 150 + i * 30, lat: (i ? 1 : -1) * W * .45, aggro: .7, tier: 1 });
+      }
+      Enemies.wave(2, .6, 0);
+      this.pressure = 4; this.tier = 1;
+    });
+
+    B(8380, 'cave', 'THROUGH THE ICE TUNNEL', true, () => {
+      HUD.warn('LOW CLEARANCE', 2.2);
+      HUD.sub('SPARROW 2-2', 'Tunnel run. Watch the walls - it is tight in there.', 3.2);
+      this.pressure = 3;
+    });
+
+    B(10000, 'wave3', 'SHAKE THEM IN THE NARROWS', false, () => {
+      HUD.banner('HEAVY PURSUIT', 'FOUR CONTACTS', 2.4);
+      Enemies.wave(4, .8, 1);
+      this.pressure = 4;
+    });
+
+    B(11400, 'avalanche', 'OUTRUN THE SLIDE', true, () => {
+      HUD.warn('AVALANCHE', 2.8);
+      HUD.sub('SPARROW 2-2', 'Whole face is sliding - do not stop for anything!', 3.4);
+      Hazards.avalanche(Player.s + 240, rndG() < .5 ? -1 : 1);
+      Hazards.iceFall(Player.s + 320, 8, 120);
+      this.pressure = 3;
+    });
+
+    B(12800, 'gauntlet', 'RUN THE FUEL GAUNTLET', false, () => {
+      Hazards.drumField(Player.s + 220, 8);
+      Hazards.drumField(Player.s + 500, 7);
+      HUD.sub('SPARROW 2-2', 'More drums. Shoot early, drive through the gap.', 3.2);
+      this.pressure = 4;
+    });
+
+    B(14200, 'gunship', 'EVADE THE GUNSHIP', true, () => {
+      HUD.banner('AIR THREAT', 'GUNSHIP OVERHEAD', 2.8);
+      HUD.sub('SPARROW 2-2', 'Rotors! They put a bird up. Keep moving and stay unpredictable.', 3.8);
+      Hazards.spawnGunship(88);
+      this.pressure = 3;
+    });
+
+    B(15200, 'cave2', 'LOSE THE BIRD IN THE TUNNEL', false, () => {
+      HUD.sub('SPARROW 2-2', 'Get in the tunnel, break their line of sight!', 3.0);
+      setTimeout(() => { if (Hazards.gunship) Hazards.gunship.dur = min(Hazards.gunship.dur, Hazards.gunship.t + 6); }, 5000);
+      this.pressure = 3;
+    });
+
+    B(16400, 'final', 'LAST STRETCH - HOLD THE THROTTLE', true, () => {
+      HUD.banner('THEY ARE COMMITTED', 'FIVE ON YOUR TAIL', 2.6);
+      Enemies.wave(5, .95, 1);
+      Hazards.iceFall(Player.s + 260, 8, 110);
+      this.pressure = 5; this.tier = 1;
+    });
+
+    B(18200, 'exfil', 'REACH THE EXTRACTION POINT', true, () => {
+      HUD.banner('EXFIL IN SIGHT', 'SPARROW ACTUAL IS ON STATION', 3.0);
+      HUD.sub('SPARROW ACTUAL', 'We see your wake. Straight line, two klicks. Bring it home.', 4.0);
+      this.pressure = 4;
+      Game.exfil = true;
+    });
+
+    B(20200, 'win', 'BOARD THE BOAT', false, () => { Game.finish(); });
+  },
+
+  reset() {
+    for (const b of this.beats) b.done = false;
+    this.next = 0; this.pressure = 0; this.pressureT = 3; this.tier = 0;
+    this.bridges.length = 0; this.checkpoint = null;
+    this.setObjective('CLEAR THE FJORD - EXFIL AT THE MOUTH', '');
+  },
+  setObjective(t, m) {
+    this.objText = t; this.objMeta = m;
+    HUD.objective(t, m);
+  },
+  saveCheckpoint(name) {
+    this.checkpoint = {
+      s: Player.s, next: this.next, pressure: this.pressure, tier: this.tier,
+      hull: max(Player.hull, 60), mag: Gun.mag, reserve: max(Gun.reserve, 90),
+      time: Game.elapsed, kills: Game.kills, shots: Gun.shots, hits: Gun.hits,
+      exfil: Game.exfil, name,
+    };
+    HUD.banner('CHECKPOINT', name || '', 1.8);
+    AU.ui(1);
+  },
+  restore() {
+    const c = this.checkpoint;
+    if (!c) { Game.restart(); return; }
+    Enemies.clear(); Hazards.init(); Parts.clear();
+    Game.avalanches.length = 0;
+    Player.reset(max(0, c.s - 60));
+    Player.hull = c.hull;
+    Gun.mag = c.mag; Gun.reserve = c.reserve;
+    Gun.shots = c.shots; Gun.hits = c.hits;
+    Game.kills = c.kills; Game.elapsed = c.time; Game.exfil = c.exfil;
+    this.next = c.next; this.pressure = c.pressure; this.tier = c.tier;
+    for (let i = 0; i < this.beats.length; i++) this.beats[i].done = i < c.next;
+    this.pressureT = 4;
+    Game.invuln = 2.5;
+    HUD.ammo(Gun.mag, Gun.reserve);
+  },
+  onKill() {
+    if (Enemies.alive() === 0 && this.pressure > 0) this.pressureT = min(this.pressureT, 4.5);
+  },
+  update(dt) {
+    /* --- hidden difficulty: hurt players are shot at less accurately, and
+           a crowd of pursuers never stacks its damage output --- */
+    Game.aiScale = clamp(.52 + Player.hull / 100 * .48, .5, 1) /
+      (1 + .14 * max(0, Enemies.alive() - 2));
+
+    /* --- beats --- */
+    while (this.next < this.beats.length && Player.s >= this.beats[this.next].s) {
+      const b = this.beats[this.next];
+      this.next++;
+      if (b.done) continue;
+      b.done = true;
+      if (b.obj) this.setObjective(b.obj, '');
+      if (b.cp) this.saveCheckpoint(b.name.toUpperCase());
+      b.fn();
+    }
+    /* --- objective distance readout --- */
+    const nb = this.beats[min(this.next, this.beats.length - 1)];
+    const km = max(0, (TRACK_LEN - Player.s)) / 1000;
+    HUD.objectiveMeta(km.toFixed(2) + ' KM TO EXFIL', 1 - km * 1000 / TRACK_LEN);
+
+    /* --- keep pressure on between beats --- */
+    this.pressureT -= dt;
+    if (this.pressureT <= 0 && Game.state === 'play' && !Game.won) {
+      this.pressureT = 5.5;
+      const alive = Enemies.alive();
+      if (alive < this.pressure && Player.s < 20000) {
+        const W = Track.widthAt(Player.s - 90);
+        Enemies.spawn({
+          s: Player.s - rg(70, 130), lat: rg(-1, 1) * W * .55,
+          aggro: clamp(.35 + Player.s / TRACK_LEN * .55 + rg(-.1, .1), .2, 1), tier: this.tier,
+        });
+        HUD.threat(Enemies.alive());
+      }
+    }
+
+    /* --- collapsing spans --- */
+    for (const br of this.bridges) {
+      if (!br.triggered && Player.s > br.s - 165) {
+        br.triggered = true;
+        AU.iceCrack([Track.x[Track.idx(br.s)], 14, Track.z[Track.idx(br.s)]], true);
+        for (const p of br.parts) {
+          p.armed = 1;
+          setTimeout(() => {
+            if (p.dead) return;
+            p.static = 0; p.falling = 1; p.vy = -1; p.spin = rg(-1.4, 1.4); p.life = 26;
+            FX.debris(p.x, p.y, p.z, 8, 1.4, [.6, .68, .74]);
+          }, p.delay * 1000);
+        }
+        HUD.warn('SPAN COMING DOWN', 2.4);
+      }
+    }
+
+    /* --- avalanche fronts --- */
+    for (let i = Game.avalanches.length - 1; i >= 0; i--) {
+      const a = Game.avalanches[i];
+      a.t += dt;
+      const u = a.t / a.dur;
+      if (u > 1) { Game.avalanches.splice(i, 1); continue; }
+      const lat = a.side * lerp(a.W * 1.15, -a.W * .55, u);
+      for (let k = 0; k < 12; k++) {
+        const ss = a.s + rg(-70, 70);
+        const p = Track.toWorld(ss, lat + rg(-8, 8));
+        Parts.add({
+          x: p[0], y: rg(0, 16), z: p[2],
+          vx: -a.side * rg(6, 20), vy: rg(-1, 5), vz: rg(-4, 4),
+          life: 1.4 + rndG() * 1.6, s0: 2.4, s1: 9,
+          c0: [.92, .95, .99], c1: [.72, .78, .86], a0: .55, a1: 0,
+          drag: .8, g: -2.2, tile: TILE.SMOKE,
+        });
+      }
+      const dl = abs(Player.lat - lat);
+      if (dl < 12 && abs(Player.s - a.s) < 90) {
+        Player.damage(24 * dt, [Track.x[Track.idx(a.s)] , 0, Track.z[Track.idx(a.s)]]);
+        Player.shake = max(Player.shake, .6);
+        Player.vx += (rndG() - .5) * 24 * dt; Player.vz += (rndG() - .5) * 24 * dt;
+      }
+    }
+  },
+};
+
+/* ---- opening cinematic: rail camera + title cards ---- */
+const Cine = {
+  t: 0, dur: 17.5, done: false,
+  cards: [
+    [0.6, 'BARENTS COAST // 0417 LOCAL', 'KVITBREEN FJORD', 'TASK FORCE NORTHWIND'],
+    [6.0, 'CALLSIGN SPARROW 2-1', 'YOU HAVE THE DRIVE', 'GET IT TO THE BOAT'],
+    [11.5, 'OPERATION', 'COLD WAKE', 'DO NOT STOP FOR ANYTHING'],
+  ],
+  lines: [
+    [1.2, 'SPARROW ACTUAL', 'Sparrow two-one, the site is blown. You are the only asset still moving.', 4.2],
+    [6.4, 'SPARROW 2-2', 'Drive is aboard. I am on your wing - we run the channel to the mouth.', 4.4],
+    [11.8, 'SPARROW ACTUAL', 'Boats are turning for the fjord mouth now. Twenty klicks. Go.', 4.0],
+  ],
+  cardI: 0, lineI: 0,
+  reset() { this.t = 0; this.done = false; this.cardI = 0; this.lineI = 0; },
+  /** camera flies the first 300 m of the canyon, then hands over */
+  update(dt) {
+    this.t += dt;
+    const u = clamp(this.t / this.dur, 0, 1);
+    while (this.cardI < this.cards.length && this.t >= this.cards[this.cardI][0]) {
+      const c = this.cards[this.cardI++];
+      HUD.titleCard(c[1], c[2], c[3], 4.4);
+    }
+    while (this.lineI < this.lines.length && this.t >= this.lines[this.lineI][0]) {
+      const l = this.lines[this.lineI++];
+      HUD.sub(l[1], l[2], l[3]);
+      AU.bark(6 + (rndG() * 4 | 0), 0, null);
+    }
+    // three camera moves: high establishing, low water skim, over-shoulder
+    const seg = u < .34 ? 0 : u < .68 ? 1 : 2;
+    const su = seg === 0 ? u / .34 : seg === 1 ? (u - .34) / .34 : (u - .68) / .32;
+    let eye, look;
+    const ps = Player.s, pp = [Player.x, Player.y, Player.z];
+    if (seg === 0) {
+      const p = Track.toWorld(ps + 120 - su * 40, lerp(46, 18, su));
+      eye = [p[0], lerp(58, 30, su), p[2]];
+      look = [pp[0], pp[1] + 2, pp[2]];
+    } else if (seg === 1) {
+      const p = Track.toWorld(ps + 26 + su * 6, lerp(-16, -5, su));
+      eye = [p[0], lerp(1.4, 2.6, su), p[2]];
+      look = [pp[0], pp[1] + 1.2, pp[2]];
+    } else {
+      const p = Track.toWorld(ps - lerp(13, 7, su), lerp(5.5, 2.2, su));
+      eye = [p[0], lerp(4.2, 2.2, su), p[2]];
+      const f = Track.toWorld(ps + 90, 0);
+      look = [lerp(pp[0], f[0], .55), pp[1] + 1.6, lerp(pp[2], f[2], .55)];
+    }
+    Cam.eye = eye;
+    Cam.fwd = V3.norm(V3.sub(look, eye));
+    Cam.up = [0, 1, 0];
+    Cam.right = V3.norm(V3.cross(Cam.fwd, Cam.up));
+    Cam.up = V3.norm(V3.cross(Cam.right, Cam.fwd));
+    Cam.fov = lerp(48, 62, u);
+    if (this.t >= this.dur) this.done = true;
+  },
+};

@@ -1,0 +1,193 @@
+
+/* ---- emitters ----------------------------------------------------- */
+const FX = {
+  flash: 0,                                    // global additive screen flash
+  /** rooster tail / hull spray */
+  spray(x, y, z, vx, vy, vz, n, sc, life) {
+    sc = sc || 1;
+    for (let i = 0; i < n; i++) {
+      Parts.add({
+        x: x + (rndG() - .5) * .6 * sc, y: y + rndG() * .3, z: z + (rndG() - .5) * .6 * sc,
+        vx: vx + (rndG() - .5) * 3.4, vy: vy + rndG() * 2.6, vz: vz + (rndG() - .5) * 3.4,
+        life: (life || .55) + rndG() * .5, s0: .28 * sc, s1: 1.5 * sc,
+        c0: [.92, .96, 1], c1: [.72, .82, .90], a0: .55, a1: 0,
+        drag: 1.5, g: -8.5, tile: TILE.SPRAY, water: 1, wake: 1,
+      });
+    }
+  },
+  mist(x, y, z, n, sc) {
+    for (let i = 0; i < n; i++) Parts.add({
+      x: x + (rndG() - .5) * 3 * sc, y: y + rndG() * 1.4, z: z + (rndG() - .5) * 3 * sc,
+      vx: (rndG() - .5) * 2, vy: .4 + rndG() * 1.2, vz: (rndG() - .5) * 2,
+      life: 1.1 + rndG() * .9, s0: 1.4 * sc, s1: 5.0 * sc,
+      c0: [.86, .92, .97], c1: [.70, .78, .86], a0: .22, a1: 0,
+      drag: 1.2, g: .4, tile: TILE.SMOKE,
+    });
+  },
+  splash(x, z, power, t) {
+    const y = waterY(x, z, t);
+    const n = clamp(8 + power * 14, 6, 46) | 0;
+    for (let i = 0; i < n; i++) {
+      const a = rndG() * TAU, sp = (1.6 + rndG() * 5) * (.5 + power);
+      Parts.add({
+        x, y: y + .1, z, vx: cos(a) * sp, vy: (3 + rndG() * 7) * (.4 + power * .7), vz: sin(a) * sp,
+        life: .5 + rndG() * .7, s0: .22 * (1 + power), s1: 1.1 * (1 + power),
+        c0: [.95, .99, 1], c1: [.75, .85, .92], a0: .8, a1: 0,
+        drag: .55, g: -12, tile: TILE.SPRAY, water: 1, wake: 1,
+      });
+    }
+    this.mist(x, y + .3, z, 3 + (power * 5) | 0, .5 + power * .6);
+    Foam.add(x, z, 2.5 + power * 4, .55 + power * .3, 1, 0, 1, .5);
+  },
+  explosion(x, y, z, power, water, t) {
+    const n = (18 + power * 16) | 0;
+    for (let i = 0; i < n; i++) {                       // fireball cores
+      const a = rndG() * TAU, e = (rndG() - .2) * 1.4, sp = (3 + rndG() * 13) * power;
+      Parts.add({
+        x, y, z, vx: cos(a) * cos(e) * sp, vy: sin(e) * sp + 3 * power, vz: sin(a) * cos(e) * sp,
+        life: .30 + rndG() * .45, s0: 1.1 * power, s1: 4.2 * power,
+        c0: [1, .82, .38], c1: [.85, .22, .05], a0: 1, a1: 0,
+        drag: 2.4, g: 2.5, tile: TILE.GLOW, add: 1, soft: 1,
+      });
+    }
+    for (let i = 0; i < n * .8; i++) {                  // smoke
+      const a = rndG() * TAU, sp = (1.5 + rndG() * 7) * power;
+      Parts.add({
+        x, y: y + rndG() * 1.5, z, vx: cos(a) * sp * .6, vy: 2.2 * power + rndG() * 3.5, vz: sin(a) * sp * .6,
+        life: 1.6 + rndG() * 2.4, s0: 1.6 * power, s1: 9 * power,
+        c0: [.24, .23, .22], c1: [.10, .10, .11], a0: .75, a1: 0,
+        drag: .85, g: 1.4, tile: TILE.SMOKE,
+      });
+    }
+    for (let i = 0; i < 14 * power; i++) {              // sparks / debris
+      const a = rndG() * TAU, e = rndG() * 1.5, sp = (7 + rndG() * 26) * power;
+      Parts.add({
+        x, y, z, vx: cos(a) * cos(e) * sp, vy: sin(e) * sp, vz: sin(a) * cos(e) * sp,
+        life: .5 + rndG() * 1.3, s0: .16, s1: .05,
+        c0: [1, .78, .35], c1: [.9, .25, .05], a0: 1, a1: .2,
+        drag: .25, g: -14, tile: TILE.GLOW, add: 1, str: .9 + rndG() * 2.2, water: 1,
+      });
+    }
+    if (water) {
+      const n2 = (10 + power * 10) | 0;
+      for (let i = 0; i < n2; i++) {                    // water column
+        const a = rndG() * TAU, sp = rndG() * 5 * power;
+        Parts.add({
+          x: x + cos(a) * sp * .4, y: y + .2, z: z + sin(a) * sp * .4,
+          vx: cos(a) * sp, vy: 12 * power + rndG() * 12, vz: sin(a) * sp,
+          life: .9 + rndG() * .9, s0: .8 * power, s1: 2.4 * power,
+          c0: [.95, 1, 1], c1: [.72, .84, .92], a0: .85, a1: 0,
+          drag: .5, g: -13, tile: TILE.SPRAY, water: 1, wake: 1,
+        });
+      }
+      Foam.add(x, z, 6 * power, .9, 1, 0, 1, .6);
+    }
+    this.flash += min(power * .12, .34);
+  },
+  sparks(x, y, z, nx, ny, nz, n, col) {
+    for (let i = 0; i < n; i++) {
+      const sp = 3 + rndG() * 11;
+      Parts.add({
+        x, y, z,
+        vx: (nx + (rndG() - .5) * 1.5) * sp, vy: (ny + (rndG() - .5) * 1.5) * sp, vz: (nz + (rndG() - .5) * 1.5) * sp,
+        life: .18 + rndG() * .4, s0: .085, s1: .03,
+        c0: col || [1, .86, .5], c1: [1, .35, .08], a0: 1, a1: 0,
+        drag: .4, g: -16, tile: TILE.GLOW, add: 1, str: 1.4 + rndG() * 2.4, water: 1,
+      });
+    }
+  },
+  puff(x, y, z, nx, ny, nz, n, col, sc) {
+    sc = sc || 1;
+    for (let i = 0; i < n; i++) Parts.add({
+      x, y, z,
+      vx: nx * (1 + rndG() * 4) + (rndG() - .5) * 2.4, vy: ny * (1 + rndG() * 4) + rndG() * 1.6,
+      vz: nz * (1 + rndG() * 4) + (rndG() - .5) * 2.4,
+      life: .55 + rndG() * .9, s0: .28 * sc, s1: 1.5 * sc,
+      c0: col || [.94, .97, 1], c1: [.78, .84, .9], a0: .8, a1: 0,
+      drag: 1.6, g: -3.5, tile: TILE.SMOKE,
+    });
+  },
+  debris(x, y, z, n, sc, col) {
+    for (let i = 0; i < n; i++) {
+      const a = rndG() * TAU, e = rndG() * 1.2, sp = 4 + rndG() * 16;
+      Parts.add({
+        x, y, z, vx: cos(a) * cos(e) * sp, vy: sin(e) * sp + 3, vz: sin(a) * cos(e) * sp,
+        life: 1.2 + rndG() * 1.6, s0: .18 * sc, s1: .14 * sc,
+        c0: col || [.72, .82, .9], c1: col || [.5, .6, .7], a0: 1, a1: .8,
+        drag: .12, g: -16, tile: TILE.SHARD, water: 1, wake: 1, rv: (rndG() - .5) * 9,
+      });
+    }
+  },
+  tracer(x, y, z, dx, dy, dz, len, col, speed) {
+    Parts.add({
+      x, y, z, vx: dx * speed, vy: dy * speed, vz: dz * speed,
+      life: len / speed, s0: .07, s1: .05,
+      c0: col || [1, .82, .45], c1: col || [1, .5, .2], a0: .95, a1: .25,
+      drag: 0, g: 0, tile: TILE.GLOW, add: 1, str: 16 + rndG() * 10, soft: 0,
+    });
+  },
+  muzzle(x, y, z, dx, dy, dz, sc) {
+    sc = sc || 1;
+    Parts.add({
+      x: x + dx * .3, y: y + dy * .3, z: z + dz * .3, vx: dx * 2, vy: dy * 2, vz: dz * 2,
+      life: .05, s0: .42 * sc, s1: .16 * sc, c0: [1, .92, .68], c1: [1, .6, .2],
+      a0: 1, a1: 0, drag: 4, g: 0, tile: TILE.GLOW, add: 1, soft: 0,
+    });
+    for (let i = 0; i < 3; i++) Parts.add({
+      x, y, z, vx: dx * (4 + rndG() * 8) + (rndG() - .5) * 3, vy: dy * 4 + (rndG() - .5) * 3,
+      vz: dz * (4 + rndG() * 8) + (rndG() - .5) * 3,
+      life: .12 + rndG() * .12, s0: .07, s1: .02, c0: [1, .8, .4], c1: [1, .3, .05],
+      a0: 1, a1: 0, drag: 1.5, g: -8, tile: TILE.GLOW, add: 1, str: 2, soft: 0,
+    });
+  },
+  /** impact dispatcher: 0 water, 1 snow/ice, 2 rock, 3 metal */
+  impact(x, y, z, nx, ny, nz, mat, t) {
+    if (mat === 0) { this.splash(x, z, .30, t); AU.impactSfx([x, y, z], 0); }
+    else if (mat === 1) { this.puff(x, y, z, nx, ny, nz, 7, [.95, .98, 1], .9); this.debris(x, y, z, 2, .5); AU.impactSfx([x, y, z], 1); }
+    else if (mat === 2) { this.sparks(x, y, z, nx, ny, nz, 5, [1, .8, .5]); this.puff(x, y, z, nx, ny, nz, 4, [.35, .34, .33], .7); AU.impactSfx([x, y, z], 2); }
+    else { this.sparks(x, y, z, nx, ny, nz, 9, [1, .9, .65]); AU.impactSfx([x, y, z], 3); }
+  },
+};
+
+/* ---- ambient snowfall (separate stream, wraps around the camera) ---- */
+const Snow = {
+  n: 900, p: null, v: null, box: 46,
+  init() {
+    this.p = new Float32Array(this.n * 3);
+    this.v = new Float32Array(this.n * 3);
+    for (let i = 0; i < this.n; i++) {
+      this.p[i * 3] = (rndG() - .5) * this.box * 2;
+      this.p[i * 3 + 1] = (rndG() - .5) * this.box * 2;
+      this.p[i * 3 + 2] = (rndG() - .5) * this.box * 2;
+      this.v[i * 3] = (rndG() - .5) * .8; this.v[i * 3 + 1] = -1.6 - rndG() * 2.2;
+      this.v[i * 3 + 2] = (rndG() - .5) * .8;
+    }
+  },
+  update(dt, cam, wind, speed) {
+    const B = this.box, B2 = B * 2;
+    for (let i = 0; i < this.n; i++) {
+      const o = i * 3;
+      this.p[o] += (this.v[o] + wind[0] - speed[0] * .35) * dt;
+      this.p[o + 1] += this.v[o + 1] * dt;
+      this.p[o + 2] += (this.v[o + 2] + wind[1] - speed[1] * .35) * dt;
+      // wrap into a box centred on the camera
+      for (let k = 0; k < 3; k++) {
+        const d = this.p[o + k] - cam[k];
+        if (d > B) this.p[o + k] -= B2; else if (d < -B) this.p[o + k] += B2;
+      }
+    }
+  },
+  fill(arr, start, t) {
+    let n = 0;
+    for (let i = 0; i < this.n; i++) {
+      const o = (start + n) * 16, q = i * 3;
+      arr[o] = this.p[q]; arr[o + 1] = this.p[q + 1]; arr[o + 2] = this.p[q + 2];
+      arr[o + 3] = .045 + (i % 7) * .012;
+      arr[o + 4] = 0; arr[o + 5] = 0; arr[o + 6] = 0; arr[o + 7] = 0;
+      arr[o + 8] = .95; arr[o + 9] = .97; arr[o + 10] = 1; arr[o + 11] = .5 + (i % 5) * .08;
+      arr[o + 12] = t * .5 + i; arr[o + 13] = TILE.GLOW; arr[o + 14] = 1; arr[o + 15] = 0;
+      n++;
+    }
+    return n;
+  },
+};

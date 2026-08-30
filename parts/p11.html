@@ -1,0 +1,445 @@
+
+/* ============================ 10 player ============================ */
+/* Arcade watercraft: forward thrust + lateral grip model, wave riding,
+   corridor collision, first person camera with bob / lean / shake.     */
+
+const VEH = {
+  thrust: 24.5, brake: 32, dragQ: 0.0024, dragL: 0.20,
+  vMax: 47, vBoost: 63,
+  gripBase: 6.4, gripDrift: 1.25, steerLo: 2.35, steerHi: 0.95,
+  hullR: 1.5,
+};
+
+const Player = {
+  x: 0, y: 0, z: 0, vx: 0, vz: 0, vy: 0, yaw: 0,
+  speed: 0, slip: 0, air: 0, rpm: .2,
+  hull: 100, dead: false, hurtT: 0,
+  boost: 1, boosting: 0, boostCd: 0,
+  s: 0, lat: 0, idx: 0, proj: { s: 0, lat: 0, i: 0 },
+  pitch: 0, roll: 0, bob: 0, bobT: 0,
+  camYaw: 0, camPitch: 0, camYawV: 0, camPitchV: 0,
+  shake: 0, shakeX: 0, shakeY: 0, shakeR: 0,
+  fov: 74, eye: [0, 1.6, 0], fwd: [0, 0, 1], right: [1, 0, 0], up: [0, 1, 0],
+  trail: [], trailT: 0, engine: null,
+  wallHitT: 0, hitCd: -9,
+  model: M4.create(),
+
+  reset(s) {
+    const p = Track.toWorld(s, 0);
+    this.x = p[0]; this.z = p[2]; this.y = 0.35;
+    this.yaw = Track.headAt(s);
+    this.vx = sin(this.yaw) * 12; this.vz = cos(this.yaw) * 12;
+    this.vy = 0; this.speed = 12; this.slip = 0; this.air = 0;
+    this.hull = 100; this.dead = false; this.hurtT = 0; this.hitCd = -9;
+    this.boost = 1; this.boostCd = 0; this.boosting = 0;
+    this.camYaw = 0; this.camPitch = 0; this.pitch = 0; this.roll = 0;
+    this.shake = 0; this.trail.length = 0;
+    this.idx = Track.idx(s);
+    this.s = s; this.lat = 0;
+  },
+  /** signed distance to each wall, negative = outside */
+  update(dt, t, input, active) {
+    const throttle = active ? (input.k('KeyW') ? 1 : 0) - (input.k('KeyS') ? 1 : 0) : 0;
+    const steer = active ? (input.k('KeyA') ? 1 : 0) - (input.k('KeyD') ? 1 : 0) : 0;
+    const hand = active && input.k('Space');
+    const wantBoost = active && input.k('ShiftLeft');
+
+    /* ---- boost meter: 3.2 s of burn, 5 s recharge ---- */
+    if (wantBoost && this.boost > .04 && this.boostCd <= 0) {
+      this.boosting = min(1, this.boosting + dt * 6);
+      this.boost = max(0, this.boost - dt / 3.2);
+      if (this.boost <= 0) this.boostCd = 2.2;
+    } else {
+      this.boosting = max(0, this.boosting - dt * 3.2);
+      if (this.boostCd > 0) this.boostCd -= dt;
+      else this.boost = min(1, this.boost + dt / 5.2);
+    }
+
+    /* ---- longitudinal ---- */
+    const fx = sin(this.yaw), fz = cos(this.yaw);
+    const rx = cos(this.yaw), rz = -sin(this.yaw);
+    let vF = this.vx * fx + this.vz * fz;
+    let vL = this.vx * rx + this.vz * rz;
+
+    const vmax = lerp(VEH.vMax, VEH.vBoost, this.boosting);
+    let acc = 0;
+    if (throttle > 0) acc = VEH.thrust * (1 + this.boosting * .75) * (1 - clamp(vF / vmax, 0, 1) * .82);
+    else if (throttle < 0) acc = vF > 1 ? -VEH.brake : -VEH.thrust * .38;
+    else acc = -VEH.dragL * 1.6;
+    if (this.air > 0) acc *= .12;
+    vF += acc * dt;
+    vF -= (VEH.dragQ * vF * abs(vF) + VEH.dragL * .25 * vF) * dt;
+    if (hand && vF > 0) vF -= 8 * dt;
+
+    /* ---- steering + drift ---- */
+    const spN = clamp(abs(vF) / VEH.vMax, 0, 1.4);
+    const steerAuth = lerp(VEH.steerLo, VEH.steerHi, smoothstep(0, 1, spN)) * (1 - this.air * .55);
+    const yawRate = steer * steerAuth * (hand ? 1.45 : 1) * clamp(abs(vF) / 7, 0, 1);
+    this.yaw += yawRate * dt;
+    const grip = (hand ? VEH.gripDrift : VEH.gripBase) * (1 - this.air * .8);
+    vL *= Math.exp(-grip * dt);
+    vL += -yawRate * vF * dt * (hand ? .85 : .55);   // rear steps out
+    this.slip = damp(this.slip, clamp(vL / max(abs(vF), 6), -1, 1), 9, dt);
+
+    this.vx = fx * vF + rx * vL; this.vz = fz * vF + rz * vL;
+    this.speed = Math.hypot(this.vx, this.vz);
+    this.rpm = damp(this.rpm, clamp(abs(vF) / VEH.vMax * .8 + (throttle > 0 ? .25 : 0) + this.boosting * .2 + abs(vL) * .02, .12, 1.25), 4, dt);
+
+    this.x += this.vx * dt; this.z += this.vz * dt;
+
+    /* ---- wave riding / air time ---- */
+    const wy = waterY(this.x, this.z, t);
+    const aheadY = waterY(this.x + fx * 4.5, this.z + fz * 4.5, t);
+    const slope = (aheadY - wy) / 4.5;
+    if (this.air <= 0) {
+      const target = wy + .38;
+      this.vy += (target - this.y) * 62 * dt;
+      this.vy -= this.vy * 7.5 * dt;
+      // launch off a rising wave face at speed
+      if (slope > .055 && vF > 24 && this.vy > 0) this.vy += slope * vF * 1.55 * dt * 24;
+      this.y += this.vy * dt;
+      if (this.y > wy + 1.05) { this.air = 1; }
+    } else {
+      this.vy -= 19.5 * dt;
+      this.y += this.vy * dt;
+      if (this.y <= wy + .38) {
+        const impact = -this.vy;
+        this.y = wy + .38; this.air = 0;
+        if (impact > 3) {
+          FX.splash(this.x, this.z, clamp(impact / 16, .2, 1.4), t);
+          AU.splashSfx([this.x, this.y, this.z], clamp(impact / 14, .2, 1));
+          this.shake = max(this.shake, clamp(impact / 26, 0, .8));
+          if (impact > 15) this.damage(clamp((impact - 15) * .9, 0, 14), null, true);
+        }
+      }
+    }
+    this.air = this.y > wy + 1.0 ? 1 : 0;
+
+    /* ---- hull attitude ---- */
+    const wn = waterNormal(this.x, this.z, t);
+    const targetPitch = clamp(-slope * 1.6 - acc * .004 + (this.air ? -.10 : 0), -.42, .42);
+    const targetRoll = clamp(-yawRate * .55 - vL * .022, -.55, .55);
+    this.pitch = damp(this.pitch, targetPitch + wn[2] * .12, 7, dt);
+    this.roll = damp(this.roll, targetRoll + wn[0] * .14, 6, dt);
+
+    /* ---- track projection + wall collision ---- */
+    Track.project(this.x, this.z, this.idx, this.proj);
+    this.idx = this.proj.i; this.s = this.proj.s; this.lat = this.proj.lat;
+    const W = Track.widthAt(this.s);
+
+    /* ---- numerical safety net: never let the craft leave the world ---- */
+    if (!isFinite(this.x) || !isFinite(this.z) || !isFinite(this.lat) || abs(this.lat) > W * 3.5) {
+      const s0 = isFinite(this.s) ? clamp(this.s, 0, TRACK_LEN - 40) : (this.lastGoodS || 0);
+      if (!isFinite(this.yaw)) this.yaw = Track.headAt(s0);
+      const p = Track.toWorld(s0, 0);
+      this.x = p[0]; this.z = p[2]; this.y = .4;
+      this.vx = sin(this.yaw) * 14; this.vz = cos(this.yaw) * 14; this.vy = 0;
+      this.idx = Track.idx(s0);
+      Track.project(this.x, this.z, this.idx, this.proj);
+      this.s = this.proj.s; this.lat = this.proj.lat;
+      this.shake = max(this.shake, .5);
+    }
+    this.lastGoodS = this.s;
+
+    const lim = W * .94 - VEH.hullR;
+    if (abs(this.lat) > lim) {
+      const sd = sign(this.lat);
+      const over = min(abs(this.lat) - lim, 10);
+      // push back inside and kill the outward velocity
+      const nx = -sd * Track.dz[this.idx], nz = sd * Track.dx[this.idx];
+      this.x += nx * over * 1.02; this.z += nz * over * 1.02;
+      const vn = this.vx * nx + this.vz * nz;
+      if (vn < 0) {
+        this.vx -= nx * vn * 1.55; this.vz -= nz * vn * 1.55;
+        const hitSpeed = -vn;
+        if (this.wallHitT <= 0 && hitSpeed > 3.5) {
+          this.wallHitT = .28;
+          this.damage(clamp(hitSpeed * 1.05, 3, 26), [this.x - nx * 4, this.y, this.z - nz * 4]);
+          FX.puff(this.x - nx * 1.4, this.y + .4, this.z - nz * 1.4, -nx, .4, -nz, 12, [.92, .96, 1], 1.1);
+          FX.debris(this.x - nx * 1.4, this.y + .3, this.z - nz * 1.4, 6, .8);
+          AU.iceCrack([this.x, this.y, this.z], false);
+          this.shake = max(this.shake, clamp(hitSpeed / 22, .15, 1));
+        }
+      }
+      // scrub speed along the wall
+      const f2 = this.vx * fx + this.vz * fz;
+      const drop = min(abs(f2), 6 + over * 3);
+      this.vx -= fx * sign(f2) * drop * dt * 3.4; this.vz -= fz * sign(f2) * drop * dt * 3.4;
+    }
+    if (this.wallHitT > 0) this.wallHitT -= dt;
+
+    /* ---- health regen ---- */
+    if (this.hurtT > 0) this.hurtT -= dt; else if (this.hull < 100) this.hull = min(100, this.hull + 13 * dt);
+    if (this.hull <= 0 && !this.dead) { this.dead = true; }
+
+    /* ---- shake decay ---- */
+    this.shake = max(0, this.shake - dt * 1.9);
+    const sh = this.shake * this.shake;
+    this.shakeX = (rndG() - .5) * sh * .09; this.shakeY = (rndG() - .5) * sh * .09;
+    this.shakeR = (rndG() - .5) * sh * .13;
+
+    /* ---- wake trail ---- */
+    this.trailT -= dt;
+    if (this.trailT <= 0 && this.air <= 0) {
+      this.trailT = .035;
+      this.trail.push({ x: this.x, z: this.z, dx: fx, dz: fz, a: 0, w: clamp(this.speed / 30, .25, 1.5) });
+      if (this.trail.length > 130) this.trail.shift();
+    }
+    for (const p of this.trail) p.a += dt;
+    while (this.trail.length && this.trail[0].a > 4.2) this.trail.shift();
+
+    /* ---- spray from the hull ---- */
+    if (this.air <= 0 && this.speed > 9) {
+      const rate = clamp(this.speed / 12, 0, 5);
+      if (rndG() < rate * dt * 12) {
+        const side = rndG() < .5 ? -1 : 1;
+        FX.spray(this.x + rx * side * 1.0 - fx * .4, wy + .15, this.z + rz * side * 1.0 - fz * .4,
+          -fx * this.speed * .12 + rx * side * (2 + this.speed * .10), 2.2 + this.speed * .10,
+          -fz * this.speed * .12 + rz * side * (2 + this.speed * .10), 2, .75 + this.speed * .012);
+      }
+      // rooster tail behind the jet nozzle
+      if (this.speed > 20 && rndG() < dt * 26) {
+        FX.spray(this.x - fx * 2.2, wy + .2, this.z - fz * 2.2,
+          -fx * this.speed * .30 + (rndG() - .5) * 3, 4 + this.speed * .17, -fz * this.speed * .30 + (rndG() - .5) * 3,
+          2, .9 + this.speed * .014, .8);
+      }
+    }
+
+    /* ---- camera ---- */
+    const look = active ? input.consumeMouse() : [0, 0];
+    this.camYawV = damp(this.camYawV, -look[0] * .0022 / max(dt, .001), 26, dt);
+    this.camPitchV = damp(this.camPitchV, -look[1] * .0022 / max(dt, .001), 26, dt);
+    this.camYaw = clamp(this.camYaw + this.camYawV * dt, -2.6, 2.6);
+    this.camPitch = clamp(this.camPitch + this.camPitchV * dt, -.85, .78);
+    // ease the view back to centre when hands are off the mouse
+    this.camYaw = damp(this.camYaw, this.camYaw * .965, .9, dt);
+
+    this.bobT += dt * (5.5 + this.rpm * 12 + this.speed * .16);
+    const bobA = clamp(this.speed / 34, 0, 1) * (this.air ? .25 : 1);
+    this.bob = sin(this.bobT) * .028 * bobA + sin(this.bobT * 2.13) * .016 * bobA;
+
+    const camYawW = this.yaw + this.camYaw + this.slip * .22;
+    const camPitchW = this.camPitch + this.pitch * .55 + this.bob * .55;
+    const camRollW = this.roll * .55 + this.slip * .10 + this.shakeR;
+    this.fov = damp(this.fov, 73 + clamp(this.speed / VEH.vMax, 0, 1.3) * 15 + this.boosting * 8, 6, dt);
+
+    const eh = 1.18 + this.bob;
+    this.eye[0] = this.x + fx * .18 + this.shakeX;
+    this.eye[1] = this.y + eh + this.shakeY;
+    this.eye[2] = this.z + fz * .18;
+    const cp = cos(camPitchW), sp2 = sin(camPitchW);
+    this.fwd[0] = sin(camYawW) * cp; this.fwd[1] = sp2; this.fwd[2] = cos(camYawW) * cp;
+    this.right[0] = -cos(camYawW); this.right[1] = 0; this.right[2] = sin(camYawW);
+    this.up = V3.norm(V3.cross(this.right, this.fwd));
+    // roll the basis about the view axis
+    const cr = cos(camRollW), sr = sin(camRollW);
+    const u2 = [this.up[0] * cr + this.right[0] * sr, this.up[1] * cr + this.right[1] * sr, this.up[2] * cr + this.right[2] * sr];
+    this.up = V3.norm(u2);
+    this.right = V3.norm(V3.cross(this.fwd, this.up));
+    this.camYawW = camYawW; this.camPitchW = camPitchW; this.camRollW = camRollW;
+
+    M4.compose(this.model, [this.x, this.y, this.z], this.yaw, this.pitch, this.roll, 1, 1, 1);
+  },
+  damage(amt, from, silent) {
+    if (this.dead || Game.invuln > 0) return;
+    this.hull -= amt;
+    this.hurtT = 3.4;
+    this.shake = max(this.shake, clamp(amt / 26, .12, .9));
+    HUD.hurt(amt);
+    if (from) {
+      const a = atan2(from[0] - this.x, from[2] - this.z);
+      HUD.dirDamage(angDiff(a, this.camYawW));
+    }
+    if (!silent) AU.impactSfx([this.x, this.y, this.z], 3);
+    if (this.hull <= 0) { this.hull = 0; this.dead = true; }
+  },
+  emitWake() {
+    for (const p of this.trail) {
+      const k = 1 - p.a / 4.2;
+      Foam.add(p.x, p.z, 1.5 + p.a * 3.4 * p.w, .40 * k * k * p.w, p.dx, p.dz, 1.6, .35);
+    }
+  },
+};
+
+/* ============================ 11 weapon ============================ */
+const WEAPON = { rpm: 700, mag: 30, reserve: 300, dmg: 27, spread: .009, reload: 2.05, range: 420 };
+
+const Gun = {
+  mag: 30, reserve: 300, fireT: 0, reloading: 0, reloadT: 0,
+  recoil: 0, recoilY: 0, kick: 0, kickV: 0, heat: 0,
+  shots: 0, hits: 0,
+  vmPos: [0, 0, 0], vmRot: [0, 0, 0], sway: [0, 0], lastAim: [0, 0],
+  reset() { this.mag = WEAPON.mag; this.reserve = WEAPON.reserve; this.reloading = 0; this.fireT = 0; this.target = null; },
+  update(dt, input, t, active) {
+    let bestT = null, bestA = 0.15;
+    const eye = Player.eye;
+    const scan = (list) => {
+      for (const e of list) {
+        if (!e || e.dead) continue;
+        let dx = e.x - eye[0], dy = (e.y + 0.85) - eye[1], dz = e.z - eye[2];
+        let dist = Math.hypot(Math.hypot(dx, dz), dy);
+        if (dist > WEAPON.range || dist < 2) continue;
+        let a = Math.acos(clamp((dx * Player.fwd[0] + dy * Player.fwd[1] + dz * Player.fwd[2]) / dist, -1, 1));
+        if (a < bestA) { bestA = a; bestT = e; }
+      }
+    };
+    scan(Enemies.list);
+    if (Hazards && Hazards.gunship) scan([Hazards.gunship]);
+    this.target = bestT;
+
+    this.fireT -= dt;
+    this.heat = max(0, this.heat - dt * 2.4);
+    if (this.reloading > 0) {
+      this.reloading -= dt;
+      if (this.reloading <= 0) {
+        this.reloading = 0;                       // must land exactly on 0
+        const need = WEAPON.mag - this.mag, take = min(need, this.reserve);
+        this.mag += take; this.reserve -= take;
+        AU.ui(0);
+      }
+    }
+    if (active) {
+      if (input.k('KeyR')) this.startReload();
+      if (input.mouseDown && this.fireT <= 0 && !this.reloading) {
+        if (this.mag > 0) this.fire(t);
+        else { this.startReload(); }
+      }
+    }
+    // recoil recovery
+    this.kickV += (-this.kick * 190 - this.kickV * 21) * dt;
+    this.kick += this.kickV * dt;
+    this.recoil = damp(this.recoil, 0, 7, dt);
+    this.recoilY = damp(this.recoilY, 0, 7, dt);
+    // weapon sway follows the look delta
+    const ay = Player.camYawV * .014, ap = Player.camPitchV * .014;
+    this.sway[0] = damp(this.sway[0], clamp(ay, -.09, .09), 9, dt);
+    this.sway[1] = damp(this.sway[1], clamp(ap, -.09, .09), 9, dt);
+  },
+  startReload() {
+    if (this.reloading > 0 || this.mag >= WEAPON.mag || this.reserve <= 0) return;
+    this.reloading = WEAPON.reload;
+    this.reloadT = 0;
+    HUD.reloading(true);
+    AU.ui(2);
+  },
+  fire(t) {
+    this.fireT = 60 / WEAPON.rpm;
+    this.mag--; this.shots++; this.heat = min(1, this.heat + .12);
+    HUD.ammo(this.mag, this.reserve);
+    this.kick = .045 + rndG() * .02;
+    this.kickV = 7.5;
+    this.recoil += .022 + rndG() * .012;
+    this.recoilY += (rndG() - .5) * .016;
+    Player.camPitch = clamp(Player.camPitch + this.recoil * .55, -.85, .78);
+    Player.camYaw = clamp(Player.camYaw + this.recoilY * .8, -2.6, 2.6);
+
+    const eye = Player.eye;
+    const sp = WEAPON.spread * (1 + Player.speed * .022 + this.heat * 1.5);
+    
+    let bx = Player.fwd[0], by = Player.fwd[1], bz = Player.fwd[2];
+    if (this.target && Game.thirdPerson) {
+      let dx = this.target.x - eye[0], dy = (this.target.y + 0.85) - eye[1], dz = this.target.z - eye[2];
+      let nd = V3.norm([dx, dy, dz]);
+      bx = lerp(bx, nd[0], 0.75);
+      by = lerp(by, nd[1], 0.75);
+      bz = lerp(bz, nd[2], 0.75);
+    }
+    
+    const d = [
+      bx + (rndG() - .5) * sp * 2 + Player.right[0] * (rndG() - .5) * sp,
+      by + (rndG() - .5) * sp * 2,
+      bz + (rndG() - .5) * sp * 2 + Player.right[2] * (rndG() - .5) * sp,
+    ];
+    const dir = V3.norm(d);
+    // muzzle sits at the viewmodel barrel, roughly
+    const mz = [
+      eye[0] + Player.fwd[0] * .75 + Player.right[0] * .26 - Player.up[0] * .18,
+      eye[1] + Player.fwd[1] * .75 + Player.right[1] * .26 - Player.up[1] * .18,
+      eye[2] + Player.fwd[2] * .75 + Player.right[2] * .26 - Player.up[2] * .18,
+    ];
+    FX.muzzle(mz[0], mz[1], mz[2], dir[0], dir[1], dir[2], 1);
+    FX.flash += .018;
+    AU.shot(null, 0, .9);
+
+    const hit = rayCast(eye, dir, WEAPON.range, true);
+    FX.tracer(mz[0], mz[1], mz[2], dir[0], dir[1], dir[2], hit ? hit.dist : WEAPON.range, [1, .85, .5], 620);
+    if (hit) {
+      if (hit.type === 'enemy') {
+        const head = hit.head;
+        const dmg = WEAPON.dmg * (head ? 2.4 : 1);
+        this.hits++;
+        const killed = hit.obj.damage(dmg, hit.p);
+        HUD.hitMark(killed);
+        AU.ui(3);
+        FX.sparks(hit.p[0], hit.p[1], hit.p[2], -dir[0], -dir[1], -dir[2], 6, [.9, .25, .18]);
+      } else if (hit.type === 'drum') {
+        hit.obj.hp -= WEAPON.dmg; this.hits++;
+        HUD.hitMark(false);
+        FX.sparks(hit.p[0], hit.p[1], hit.p[2], -dir[0], -dir[1], -dir[2], 7);
+        if (hit.obj.hp <= 0) Hazards.blow(hit.obj, t);
+      } else if (hit.type === 'prop') {
+        FX.impact(hit.p[0], hit.p[1], hit.p[2], -dir[0], -dir[1], -dir[2], hit.mat, t);
+      } else {
+        FX.impact(hit.p[0], hit.p[1], hit.p[2], hit.n ? hit.n[0] : -dir[0], hit.n ? hit.n[1] : 1, hit.n ? hit.n[2] : -dir[2], hit.mat, t);
+      }
+    }
+  },
+};
+
+/* ---- world raycast: enemies, hazards, terrain shell, water ---------- */
+function rayCast(o, d, maxD, hostileOnly) {
+  let best = null, bestT = maxD;
+  // enemies
+  for (const e of Enemies.list) {
+    if (e.dead) continue;
+    const t = raySphere(o, d, [e.x, e.y + .85, e.z], 1.35);
+    if (t !== null && t < bestT) {
+      bestT = t; best = { type: 'enemy', obj: e, dist: t, head: false, p: [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t] };
+    }
+    const th = raySphere(o, d, [e.x + sin(e.yaw) * -.1, e.y + 1.72, e.z + cos(e.yaw) * -.1], .38);
+    if (th !== null && th < bestT) {
+      bestT = th; best = { type: 'enemy', obj: e, dist: th, head: true, p: [o[0] + d[0] * th, o[1] + d[1] * th, o[2] + d[2] * th] };
+    }
+  }
+  // hazards / props with collision spheres
+  for (const h of Hazards.solids) {
+    if (h.dead) continue;
+    const t = raySphere(o, d, [h.x, h.y + (h.hy || .5), h.z], h.r + .2);
+    if (t !== null && t < bestT) {
+      bestT = t; best = { type: h.kind === 'drum' ? 'drum' : 'prop', obj: h, dist: t, mat: h.mat === undefined ? 1 : h.mat, p: [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t] };
+    }
+  }
+  // terrain shell + water plane (coarse march)
+  const step = 2.6;
+  let hint = Track.idx(Player.s);
+  const pr = { s: 0, lat: 0, i: hint };
+  for (let t = 2; t < bestT; t += step) {
+    const px = o[0] + d[0] * t, py = o[1] + d[1] * t, pz = o[2] + d[2] * t;
+    const wy = waterY(px, pz, Game.time);
+    if (py < wy) {
+      const tt = t - step * .5;
+      best = { type: 'world', dist: tt, mat: 0, n: [0, 1, 0], p: [o[0] + d[0] * tt, wy, o[2] + d[2] * tt] };
+      break;
+    }
+    Track.project(px, pz, pr.i, pr); hint = pr.i;
+    const W = Track.w[pr.i], au = abs(pr.lat) / W;
+    const wallH = pr.lat < 0 ? Track.wl[pr.i] : Track.wr[pr.i];
+    const sy = shellY(au, W, wallH);
+    const cave = Track.cave[pr.i];
+    const roofY = 1.5 + 16 + W * .5 + wallH * .06;
+    if ((au > .98 && py < sy) || (cave > .5 && py > roofY)) {
+      best = { type: 'world', dist: t, mat: au > 1.05 ? 1 : 2, n: null, p: [px, py, pz] };
+      break;
+    }
+  }
+  return best;
+}
+function raySphere(o, d, c, r) {
+  const ox = o[0] - c[0], oy = o[1] - c[1], oz = o[2] - c[2];
+  const b = ox * d[0] + oy * d[1] + oz * d[2];
+  const cc = ox * ox + oy * oy + oz * oz - r * r;
+  const h = b * b - cc;
+  if (h < 0) return null;
+  const t = -b - sqrt(h);
+  return t > .2 ? t : null;
+}

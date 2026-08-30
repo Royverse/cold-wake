@@ -1,0 +1,282 @@
+
+/* ============================ 15 hud =============================== */
+/* Thin military overlay: canvas gauges + DOM text. Everything fades or
+   decays on a timer so the screen is quiet when nothing is happening.  */
+
+const HUD = {
+  el: {}, subs: [], bannerT: 0, warnT: 0, hitT: 0, killMark: false,
+  dirs: [], dirPool: 6, tcardT: 0, suppressT: 0, threatN: 0, flashT: 0,
+  spdCtx: null, compCtx: null, shownMag: -1, shownRes: -1,
+
+  init() {
+    const g = id => $(id);
+    this.el = {
+      hud: g('hud'), subs: g('subs'), banner: g('banner'), warn: g('warn'),
+      objtxt: g('objtxt'), objmet: g('objmet'), objbar: g('objbar'),
+      mag: g('magtxt'), res: g('restxt'), reload: g('reloadmsg'),
+      hp: g('hp'), hpbar: g('hp').querySelector('u'),
+      boost: g('boost'), boostf: g('boost').querySelector('u'),
+      dmg: g('dmg'), lowhp: g('lowhp'), flash: g('flash'), fade: g('fade'),
+      hm: g('hm'), dirs: g('dirs'), tcard: g('tcard'), snow: g('snowfx'),
+      tick: g('tickthreat'), letter: g('letter'), tgt: g('tgt'),
+    };
+    this.spdCtx = $('spd').getContext('2d');
+    this.compCtx = $('comp').getContext('2d');
+    for (let i = 0; i < this.dirPool; i++) {
+      const d = document.createElement('div');
+      d.className = 'dind';
+      this.el.dirs.appendChild(d);
+      this.dirs.push({ el: d, t: 0, a: 0 });
+    }
+  },
+  show(on) { this.el.hud.classList.toggle('on', !!on); },
+  cine(on) { this.el.hud.classList.toggle('cine', !!on); },
+  letterbox(on) { this.el.letter.classList.toggle('on', !!on); },
+
+  sub(who, text, dur, enemy) {
+    this.subs.push({ who, text, t: dur || 3, enemy: !!enemy });
+    while (this.subs.length > 3) this.subs.shift();
+    this.renderSubs();
+  },
+  renderSubs() {
+    let h = '';
+    for (const s of this.subs) h += '<div class="' + (s.enemy ? 'en' : '') + '"><span class="who">' + s.who + ':</span> ' + s.text + '</div>';
+    this.el.subs.innerHTML = h;
+  },
+  banner(a, b, dur) {
+    this.el.banner.children[0].textContent = a;
+    this.el.banner.children[1].textContent = b;
+    this.el.banner.classList.add('on');
+    this.bannerT = dur || 2.2;
+  },
+  warn(t, dur) { this.el.warn.textContent = t; this.el.warn.classList.add('on'); this.warnT = dur || 2; AU.ui(2); },
+  titleCard(l1, l2, l3, dur) {
+    const c = this.el.tcard;
+    c.children[0].textContent = l1; c.children[1].textContent = l2; c.children[2].textContent = l3;
+    c.classList.add('on'); this.tcardT = dur || 4;
+  },
+  objective(t, m) { setTxt(this.el.objtxt, t); if (m !== undefined) setTxt(this.el.objmet, m); AU.ui(2); },
+  objectiveMeta(m, prog) {
+    setTxt(this.el.objmet, m);
+    const p = (clamp(prog, 0, 1) * 200 | 0) / 2;
+    if (p !== this._objP) { this._objP = p; this.el.objbar.style.width = p + '%'; }
+  },
+  ammo(mag, res) {
+    if (mag !== this.shownMag) { setTxt(this.el.mag, String(mag)); this.el.mag.classList.toggle('low', mag <= 6); this.shownMag = mag; }
+    if (res !== this.shownRes) { setTxt(this.el.res, '/ ' + res); this.shownRes = res; }
+  },
+  reloading(on) { this.el.reload.classList.toggle('on', !!on); },
+  hitMark(kill) { this.hitT = .22; this.killMark = !!kill; this.el.hm.classList.toggle('kill', !!kill); },
+  hurt(amt) {
+    this.flashT = max(this.flashT, clamp(amt / 30, .12, .5));
+    this.el.dmg.classList.add('hurt');
+  },
+  dirDamage(ang) {
+    let best = this.dirs[0];
+    for (const d of this.dirs) if (d.t < best.t) best = d;
+    best.t = 1.35; best.a = ang;
+  },
+  suppress() { this.suppressT = max(this.suppressT, .5); },
+  threat(n) { this.threatN = n; },
+
+  update(dt) {
+    // subtitle decay
+    let dirty = false;
+    for (let i = this.subs.length - 1; i >= 0; i--) {
+      this.subs[i].t -= dt;
+      if (this.subs[i].t <= 0) { this.subs.splice(i, 1); dirty = true; }
+    }
+    if (dirty) this.renderSubs();
+    if (this.bannerT > 0) { this.bannerT -= dt; if (this.bannerT <= 0) this.el.banner.classList.remove('on'); }
+    if (this.warnT > 0) { this.warnT -= dt; if (this.warnT <= 0) this.el.warn.classList.remove('on'); }
+    if (this.tcardT > 0) { this.tcardT -= dt; if (this.tcardT <= 0) this.el.tcard.classList.remove('on'); }
+    if (this.hitT > 0) { this.hitT -= dt; this.el.hm.style.opacity = clamp(this.hitT / .22, 0, 1); }
+    if (this.suppressT > 0) this.suppressT -= dt;
+
+    // damage vignette: constant from hull loss + a punch on each hit
+    const low = 1 - clamp(Player.hull / 100, 0, 1);
+    if (this.flashT > 0) this.flashT -= dt * 2.2;
+    const v = (clamp(low * .85 + max(this.flashT, 0) + this.suppressT * .35, 0, 1) * 20 | 0) / 20;
+    if (v !== this._dmgV) { this._dmgV = v; this.el.dmg.style.opacity = v; }
+    if (this.flashT <= 0) this.el.dmg.classList.remove('hurt');
+    // the low-health pulse is a CSS animation so it never repaints per frame
+    const lowState = low > .78 ? 2 : low > .55 ? 1 : 0;
+    if (lowState !== this._lowState) {
+      this._lowState = lowState;
+      this.el.lowhp.classList.toggle('on', lowState === 1);
+      this.el.lowhp.classList.toggle('crit', lowState === 2);
+    }
+
+    // directional damage arrows
+    for (const d of this.dirs) {
+      if (d.t > 0) {
+        d.t -= dt;
+        d.el.style.opacity = clamp(d.t / 1.35, 0, 1) * .95;
+        d.el.style.transform = 'rotate(' + (-d.a * 180 / PI) + 'deg)';
+      } else if (d.el.style.opacity !== '0') d.el.style.opacity = '0';
+    }
+
+    // meters (only touch the DOM when a value actually moves)
+    const hpw = clamp(Player.hull, 0, 100) | 0;
+    if (hpw !== this._hpw) {
+      this._hpw = hpw; this.el.hpbar.style.width = hpw + '%';
+      this.el.hp.classList.toggle('crit', Player.hull < 35);
+    }
+    const bw = (Player.boost * 100) | 0;
+    if (bw !== this._bw) { this._bw = bw; this.el.boostf.style.height = bw + '%'; }
+    const rdy = Player.boost > .99 && Player.boostCd <= 0;
+    if (rdy !== this._rdy) { this._rdy = rdy; this.el.boost.classList.toggle('rdy', rdy); }
+    const rl = Gun.reloading > 0;
+    if (rl !== this._rl) { this._rl = rl; this.reloading(rl); }
+    this.ammo(Gun.mag, Gun.reserve);
+    const n = Enemies.alive();
+    if (n !== this.threatN) {
+      this.threatN = n;
+      this.el.tick.innerHTML = 'CONTACTS <b class="' + (n > 3 ? 'hot' : '') + '">' + n + '</b>';
+    }
+    const sn = (0.10 + clamp(Player.speed / 60, 0, 1) * .35).toFixed(2);
+    if (sn !== this._sn) { this._sn = sn; this.el.snow.style.opacity = sn; }
+
+    // gauges alternate frames - 30 Hz is indistinguishable and halves the cost
+    this._flip = !this._flip;
+    if (this._flip) this.speedo(); else this.compass();
+    this.updateTgt();
+  },
+
+  updateTgt() {
+    const el = this.el.tgt;
+    if (!el) return;
+    const t = Gun.target;
+    if (!t || t.dead || Game.fpv() || !R || !R.vp) {
+      el.classList.remove('on', 'locked');
+      return;
+    }
+    const vp = R.vp;
+    const w = t.x * vp[3] + (t.y + 0.85) * vp[7] + t.z * vp[11] + vp[15];
+    if (w <= 0.1) { el.classList.remove('on', 'locked'); return; }
+    const nx = (t.x * vp[0] + (t.y + 0.85) * vp[4] + t.z * vp[8] + vp[12]) / w;
+    const ny = (t.x * vp[1] + (t.y + 0.85) * vp[5] + t.z * vp[9] + vp[13]) / w;
+    const px = (nx * 0.5 + 0.5) * window.innerWidth;
+    const py = (-ny * 0.5 + 0.5) * window.innerHeight;
+    el.style.left = px + 'px';
+    el.style.top = py + 'px';
+    el.classList.add('on');
+    el.classList.toggle('locked', true);
+  },
+
+  /** dial furniture is baked once; only the live parts redraw */
+  speedo() {
+    const S = 336, RAD = 128, cx = S / 2, cy = S / 2;
+    const a0 = PI * .72, a1 = PI * 2.28, maxK = 240;
+    if (!this._dial) {
+      const d = document.createElement('canvas'); d.width = d.height = S;
+      const x = d.getContext('2d');
+      x.lineWidth = 2; x.strokeStyle = 'rgba(223,243,236,.18)';
+      x.beginPath(); x.arc(cx, cy, RAD, a0, a1); x.stroke();
+      for (let i = 0; i <= 12; i++) {
+        const u = i / 12, a = a0 + (a1 - a0) * u, maj = i % 3 === 0;
+        x.strokeStyle = maj ? 'rgba(223,243,236,.75)' : 'rgba(223,243,236,.3)';
+        x.lineWidth = maj ? 3 : 2;
+        x.beginPath();
+        x.moveTo(cx + cos(a) * (RAD - (maj ? 17 : 9)), cy + sin(a) * (RAD - (maj ? 17 : 9)));
+        x.lineTo(cx + cos(a) * RAD, cy + sin(a) * RAD);
+        x.stroke();
+        if (maj) {
+          x.fillStyle = 'rgba(223,243,236,.5)'; x.font = '600 15px ui-monospace,monospace';
+          x.textAlign = 'center'; x.textBaseline = 'middle';
+          x.fillText(String((maxK * u) | 0), cx + cos(a) * (RAD - 34), cy + sin(a) * (RAD - 34));
+        }
+      }
+      this._dial = d;
+    }
+    const c = this.spdCtx;
+    c.clearRect(0, 0, S, S);
+    c.drawImage(this._dial, 0, 0);
+    const kmh = Player.speed * 3.6;
+    const u = clamp(kmh / maxK, 0, 1);
+    if (!this._grd) { this._grd = c.createLinearGradient(0, 0, S, S); this._grd.addColorStop(0, '#8fd4ff'); this._grd.addColorStop(1, '#dff3ec'); }
+    c.strokeStyle = this._grd; c.lineWidth = 6; c.lineCap = 'round';
+    c.beginPath(); c.arc(cx, cy, RAD - 4, a0, a0 + (a1 - a0) * u); c.stroke();
+    c.strokeStyle = Player.boosting > .05 ? 'rgba(143,212,255,.95)' : 'rgba(223,243,236,.35)';
+    c.lineWidth = 3;
+    c.beginPath(); c.arc(cx, cy, RAD - 20, a0, a0 + (a1 - a0) * clamp(Player.rpm / 1.25, 0, 1)); c.stroke();
+    const na = a0 + (a1 - a0) * u;
+    c.strokeStyle = '#dff3ec'; c.lineWidth = 3; c.lineCap = 'butt';
+    c.beginPath(); c.moveTo(cx - cos(na) * 16, cy - sin(na) * 16);
+    c.lineTo(cx + cos(na) * (RAD - 26), cy + sin(na) * (RAD - 26)); c.stroke();
+    c.fillStyle = '#04070a'; c.strokeStyle = 'rgba(223,243,236,.6)'; c.lineWidth = 2;
+    c.beginPath(); c.arc(cx, cy, 7, 0, TAU); c.fill(); c.stroke();
+    c.fillStyle = '#dff3ec'; c.textAlign = 'center'; c.textBaseline = 'alphabetic';
+    c.font = '700 46px ui-monospace,monospace';
+    c.fillText(String(kmh | 0), cx, cy + 74);
+    c.font = '400 13px ui-monospace,monospace'; c.fillStyle = 'rgba(223,243,236,.5)';
+    c.fillText('KM/H', cx, cy + 94);
+    if (Player.air > 0) { c.fillStyle = '#ffb454'; c.fillText('AIRBORNE', cx, cy - 44); }
+  },
+
+  /** the 360 degree tape is baked once and scrolled with drawImage */
+  compass() {
+    const c = this.compCtx, W = 840, H = 60;
+    const span = 130 * DEG, ppr = W / span;
+    if (!this._tape) {
+      const total = Math.ceil(TAU * ppr);
+      const cv = document.createElement('canvas'); cv.width = total; cv.height = H;
+      const x = cv.getContext('2d');
+      x.textAlign = 'center'; x.textBaseline = 'middle';
+      for (let d = 0; d < 360; d += 15) {
+        const px = d * DEG * ppr;
+        x.strokeStyle = 'rgba(223,243,236,.22)'; x.lineWidth = 2;
+        x.beginPath(); x.moveTo(px, 42); x.lineTo(px, 50); x.stroke();
+      }
+      const dirs = [['N', 0], ['NE', 45], ['E', 90], ['SE', 135], ['S', 180], ['SW', 225], ['W', 270], ['NW', 315]];
+      for (const [lbl, deg] of dirs) {
+        const px = deg * DEG * ppr;
+        x.fillStyle = 'rgba(223,243,236,.9)';
+        x.font = (lbl.length === 1 ? '700 22px' : '400 15px') + ' ui-monospace,monospace';
+        x.fillText(lbl, px, 22);
+        x.strokeStyle = 'rgba(223,243,236,.6)'; x.lineWidth = 2;
+        x.beginPath(); x.moveTo(px, 38); x.lineTo(px, 52); x.stroke();
+      }
+      this._tape = cv; this._tapeW = total; this._ppr = ppr;
+    }
+    const yaw = Player.camYawW || 0;
+    const total = this._tapeW;
+    let src = (-yaw * this._ppr - W / 2) % total;
+    if (src < 0) src += total;
+    c.clearRect(0, 0, W, H);
+    const first = min(W, total - src);
+    c.drawImage(this._tape, src, 0, first, H, 0, 0, first, H);
+    if (first < W) c.drawImage(this._tape, 0, 0, W - first, H, first, 0, W - first, H);
+    c.strokeStyle = 'rgba(223,243,236,.25)'; c.lineWidth = 2;
+    c.beginPath(); c.moveTo(0, 46); c.lineTo(W, 46); c.stroke();
+    const ahead = Track.toWorld(min(Player.s + 420, TRACK_LEN - 10), 0);
+    const ab = angDiff(atan2(ahead[0] - Player.x, ahead[2] - Player.z), yaw);
+    if (abs(ab) < span / 2) {
+      const px = W / 2 - ab * ppr;
+      c.fillStyle = '#ffb454';
+      c.beginPath(); c.moveTo(px, 30); c.lineTo(px - 7, 18); c.lineTo(px + 7, 18); c.closePath(); c.fill();
+    }
+    c.fillStyle = '#dff3ec';
+    c.beginPath(); c.moveTo(W / 2, 52); c.lineTo(W / 2 - 6, 60); c.lineTo(W / 2 + 6, 60); c.closePath(); c.fill();
+  },
+
+  fade(v, ms) {
+    this.el.fade.style.transition = 'opacity ' + (ms || 600) + 'ms linear';
+    this.el.fade.style.opacity = v;
+  },
+  flash(v) {
+    this.el.flash.style.transition = 'none';
+    this.el.flash.style.opacity = v;
+    requestAnimationFrame(() => {
+      this.el.flash.style.transition = 'opacity 420ms ease-out';
+      this.el.flash.style.opacity = 0;
+    });
+  },
+  reset() {
+    this.subs.length = 0; this.renderSubs();
+    this.el.banner.classList.remove('on'); this.el.warn.classList.remove('on');
+    this.el.tcard.classList.remove('on');
+    this.shownMag = -1; this.shownRes = -1;
+    for (const d of this.dirs) { d.t = 0; d.el.style.opacity = '0'; }
+  },
+};
