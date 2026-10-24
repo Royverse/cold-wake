@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
 <meta name="theme-color" content="#04070a"/>
 <meta name="description" content="Cold Wake // Operation Whitewater — A high-speed 3D tactical combat pursuit watercraft experience built with zero external assets in pure WebGL2 and Web Audio."/>
 <meta property="og:title" content="COLD WAKE // OPERATION WHITEWATER"/>
@@ -147,7 +147,7 @@ body.playing{cursor:none}
 .keys b{display:inline-block;min-width:74px;color:var(--hud);font-weight:400}
 .cta{margin-top:22px;font-size:14px;letter-spacing:.3em;color:var(--hud);cursor:pointer;
   border:1px solid rgba(223,243,236,.35);padding:12px 0;text-align:center;pointer-events:auto;
-  transition:background .2s,box-shadow .2s}
+  transition:background .2s,box-shadow .2s}.cta{background:transparent;width:100%;font-family:inherit}:focus-visible{outline:2px solid var(--ice);outline-offset:2px}@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
 .cta:hover{background:rgba(223,243,236,.1);box-shadow:0 0 26px rgba(143,212,255,.18)}
 .github-cta{display:block;text-decoration:none;margin-top:10px;font-size:11px;letter-spacing:.22em;color:var(--ice);border:1px solid rgba(143,212,255,.32);background:rgba(143,212,255,.05);padding:11px 0;text-align:center;pointer-events:auto;transition:background .2s,box-shadow .2s,border-color .2s}
 .github-cta:hover{background:rgba(143,212,255,.14);box-shadow:0 0 22px rgba(143,212,255,.28);color:#fff;border-color:rgba(143,212,255,.6)}
@@ -174,6 +174,21 @@ body.playing{cursor:none}
 #tgt.on { opacity: 0.6; }
 #tgt.locked { border-color: var(--red); box-shadow: 0 0 6px var(--red); opacity: 0.9; }
 </style>
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "WebApplication",
+  "name": "Cold Wake // Operation Whitewater",
+  "description": "High-speed 3D tactical combat pursuit watercraft experience built in pure WebGL2 and Web Audio.",
+  "applicationCategory": "GameApplication",
+  "author": {
+    "@type": "Person",
+    "name": "Roy Mootsana",
+    "url": "https://roymootsana.art"
+  }
+}
+</script>
 </head>
 <body>
 <canvas id="view"></canvas>
@@ -245,7 +260,7 @@ body.playing{cursor:none}
       <span><b>SHIFT</b>Boost</span><span><b>R</b>Reload</span>
       <span><b>SPACE</b>Handbrake / drift</span><span><b>ESC</b>Pause</span>
     </div>
-    <div class="cta" id="btn-deploy">CLICK TO DEPLOY</div>
+    <button type="button" class="cta" id="btn-deploy" aria-label="Deploy mission">CLICK TO DEPLOY</button>
     <a class="github-cta" href="https://github.com/Royverse/cold-wake" target="_blank" rel="noopener noreferrer">OPEN SOURCE ON GITHUB &middot; ROYVERSE/COLD-WAKE</a>
     <div class="small">Mouse is captured on deploy &middot; ESC releases it.<br/>
       Estimated run time 8&ndash;12 minutes &middot; checkpoints are automatic.</div>
@@ -259,9 +274,9 @@ body.playing{cursor:none}
     <div class="rule"></div>
     <div class="meta" id="pausemeta"></div>
     <div class="btnrow">
-      <div class="cta" id="btn-resume">RESUME</div>
-      <div class="cta" id="btn-check">RESTART CHECKPOINT</div>
-      <div class="cta" id="btn-restart">RESTART MISSION</div>
+      <button type="button" class="cta" id="btn-resume" aria-label="Resume mission">RESUME</button>
+      <button type="button" class="cta" id="btn-check" aria-label="Restart from checkpoint">RESTART CHECKPOINT</button>
+      <button type="button" class="cta" id="btn-restart" aria-label="Restart mission from beginning">RESTART MISSION</button>
       <a class="github-cta" href="https://github.com/Royverse/cold-wake" target="_blank" rel="noopener noreferrer">SOURCE CODE ON GITHUB</a>
     </div>
     <div class="small">Quality: <span id="qtag">AUTO</span> &middot; press Q to cycle &middot; press P for perf overlay</div>
@@ -276,7 +291,7 @@ body.playing{cursor:none}
     <div class="rule"></div>
     <div class="stats" id="endstats"></div>
     <div class="btnrow">
-      <div class="cta" id="btn-again">RUN IT AGAIN</div>
+      <button type="button" class="cta" id="btn-again" aria-label="Run mission again">RUN IT AGAIN</button>
       <a class="github-cta" href="https://github.com/Royverse/cold-wake" target="_blank" rel="noopener noreferrer">VIEW SOURCE ON GITHUB</a>
     </div>
   </div>
