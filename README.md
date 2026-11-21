@@ -1,8 +1,8 @@
 ﻿# COLD WAKE // OPERATION WHITEWATER
 
-[![Live Demo](https://img.shields.io/badge/Play_Live-Netlify-00ad9f?style=for-the-badge&logo=netlify)](http://cold-wake-game-1.netlify.app)
-[![Tech](https://img.shields.io/badge/Engine-Vanilla_WebGL2-blue?style=for-the-badge&logo=webgl)](http://cold-wake-game-1.netlify.app)
-[![Audio](https://img.shields.io/badge/Audio-Web_Audio_API-orange?style=for-the-badge)](http://cold-wake-game-1.netlify.app)
+[![Live Demo](https://img.shields.io/badge/Play_Live-roymootsana.art%2Fcold--wake-00ad9f?style=for-the-badge&logo=netlify)](https://roymootsana.art/cold-wake/)
+[![Tech](https://img.shields.io/badge/Engine-Vanilla_WebGL2-blue?style=for-the-badge&logo=webgl)](https://roymootsana.art/cold-wake/)
+[![Audio](https://img.shields.io/badge/Audio-Web_Audio_API-orange?style=for-the-badge)](https://roymootsana.art/cold-wake/)
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 
 > **"Exfil with the drive. Do not stop."**
@@ -13,7 +13,7 @@
 
 ## 🎮 Play Live
 
-- **Production Deployment**: [http://cold-wake-game-1.netlify.app](http://cold-wake-game-1.netlify.app)
+- **Production Deployment**: [https://roymootsana.art/cold-wake/](https://roymootsana.art/cold-wake/)
 - **Repository**: [https://github.com/Royverse/cold-wake](https://github.com/Royverse/cold-wake)
 
 ---
